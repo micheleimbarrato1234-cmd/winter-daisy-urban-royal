@@ -1,0 +1,429 @@
+\chapter{Firmware Developments}
+\label{ch:dev}
+
+The changes described here were made in the SR5E1 CAN library and, where
+the SDK had no hook, in weakly-defined Motor Control functions. Each
+subsection states the defect, the design constraint, and the resulting
+code. Listings are shortened; complete functions are in
+Appendix~\ref{ch:app}.
+
+\section{Mutually exclusive \texttt{EXECUTE\_COMMAND}}
+\label{sec:exec}
+
+\subsection{The defect}
+\texttt{EXECUTE\_COMMAND} (identifier \texttt{0x33}) carries a bit-mask of
+machine-level actions. The original decoder was a sequence of independent
+\texttt{if} blocks: one for start, one for stop, one for reset, and so on.
+Two consequences followed.
+
+\begin{itemize}[leftmargin=1.6em]
+  \item Because start was coded as
+        \texttt{if (RxArr[0] \& EXE\_START\_MOTOR)} and stop as
+        \texttt{else if (!(RxArr[0] \& EXE\_START\_MOTOR))}, \emph{every}
+        frame produced either a start or a stop. There was no way to send
+        a reset, a ping or a fault acknowledgement without also commanding
+        the machine to stop. The \texttt{else if} was not a second flag; it
+        was the complement of the first.
+  \item Reset lived in its own \texttt{if} after the start/stop path, so a
+        single CAN frame could emit two FCP frames---a stop and a reset---
+        back to back. On a bus already running at the diagnostic period of
+        \SI{100}{\milli\second}, the extra burst was visible as a glitch in
+        machine state and as a pair of ACKs that a careless consumer could
+        mis-attribute.
+\end{itemize}
+
+\subsection{The repair}
+The decoder was rewritten around an explicit \texttt{validCommand} flag
+and a chain of \texttt{if / else if} that commits to at most one Motor
+Control command per CAN frame. The start bit still means start; its
+absence no longer means stop. Stop, reset, fault acknowledgement, encoder
+alignment and ping are each a distinct flag, and only the first one that
+matches is translated. If no recognised flag is set,
+\texttt{validCommand} stays false and nothing is fed to the FCP layer.
+
+\begin{lstlisting}[style=cstyle,caption={Decoded EXECUTE\_COMMAND path (simplified).},label=lst:exec]
+case EXECUTE_COMMAND:
+    bool validCommand = true;
+    msg[0] = MC_PROTOCOL_CODE_EXECUTE_CMD;
+    msg[1] = 0x01;
+
+    if (RxArr[0] & EXE_START_MOTOR) {
+        msg[2] = MC_PROTOCOL_CMD_START_MOTOR;
+    } else if (RxArr[0] & EXE_STOP_MOTOR) {
+        msg[2] = MC_PROTOCOL_CMD_STOP_MOTOR;
+    } else if (RxArr[0] & EXE_RESET) {
+        msg[2] = MC_PROTOCOL_CMD_RESET;
+    } else if (RxArr[0] & EXE_FAULT_ACK) {
+        msg[2] = MC_PROTOCOL_CMD_FAULT_ACK;
+    } else if (RxArr[0] & EXE_ENCODER_ALIGN) {
+        msg[2] = MC_PROTOCOL_CMD_ENCODER_ALIGN;
+    } else {
+        validCommand = false;
+    }
+
+    if (validCommand) {
+        msg[3] = SelfCRCCalc(msg);
+        for (count = 0; count < (msg[1] + 3); count++) {
+            (void) CFCP_RX_IRQ_Handler(&pFDCAN, msg[count]);
+        }
+    }
+    break;
+\end{lstlisting}
+
+The listing is the version that was kept. An intermediate attempt, visible
+on the project slides, still treated the absence of the start bit as stop
+and then appended a second FCP feed for reset. That version removed the
+double start/stop but not the double transmission; the \texttt{validCommand}
+form removes both.
+
+\subsection{Flags consumed by the decoder}
+\Cref{tab:exec-flags} records the bit-mask as it appears in the DBC and in
+the firmware. Bits not listed are reserved and must be zero; the decoder
+ignores them so that a future GUI revision can claim them without breaking
+old boards.
+
+\begin{table}[ht]
+\centering
+\caption{EXECUTE\_COMMAND bit-mask.}
+\label{tab:exec-flags}
+\begin{tabular}{ccl}
+\toprule
+Byte & Bit & Flag \\
+\midrule
+0 & 1 & \texttt{EXE\_START\_MOTOR} \\
+0 & 2 & \texttt{STOP\_RAMP} \\
+0 & 3 & \texttt{RESET} \\
+0 & 5 & \texttt{EXE\_PING} \\
+0 & 6 & \texttt{FAULT\_ACK} \\
+0 & 7 & \texttt{ENCODER\_ALIGN} \\
+1 & 0 & \texttt{EXE\_IQDREF\_CLEAR} \\
+1 & 1 & \texttt{GET\_BOARD\_INFO} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Independent $I_d$ and $I_q$ references}
+\label{sec:id-iq}
+
+\subsection{Why the pair is not enough}
+\texttt{SET\_CURRENT\_ID\_IQ} (identifier \texttt{0x3A}) already writes both
+axes in one frame. Characterisation, however, almost always holds one axis
+and moves the other: a flux-map identification holds $I_q = 0$ and sweeps
+$I_d$; a torque-linearity test holds $I_d = 0$ (or a weakening value) and
+sweeps $I_q$. Doing that with a paired command requires the bench to
+remember the axis it does not want to change and to rewrite it on every
+frame. Independent commands remove that state from the bench.
+
+\subsection{Protocol codes}
+Two Motor Control codes that the original library did not use were claimed:
+
+\begin{lstlisting}[style=cstyle,caption={New protocol codes for independent current references.}]
+#define MC_PROTOCOL_CODE_SET_CURRENT_ID_REF  0x0F
+#define MC_PROTOCOL_CODE_SET_CURRENT_IQ_REF  0x11
+\end{lstlisting}
+
+On the CAN side the corresponding identifiers, after the offset rule and
+after collision avoidance with the ramp window, are \texttt{0x3B}
+(\texttt{SET\_CURRENT\_ID}) and \texttt{0x3C} (\texttt{SET\_CURRENT\_IQ}).
+Each carries a 16-bit signed little-endian set-point; the FCP length byte
+is therefore \texttt{0x02}.
+
+\begin{lstlisting}[style=cstyle,caption={DYNO2DW cases for independent $I_d$ / $I_q$.},label=lst:id-iq-dyno]
+case SET_CURRENT_ID:
+    msg[0] = MC_PROTOCOL_CODE_SET_CURRENT_ID_REF;
+    msg[1] = 0x02;
+    msg[2] = RxArr[0];
+    msg[3] = RxArr[1];
+    msg[4] = SelfCRCCalc(msg);
+    break;
+
+case SET_CURRENT_IQ:
+    msg[0] = MC_PROTOCOL_CODE_SET_CURRENT_IQ_REF;
+    msg[1] = 0x02;
+    msg[2] = RxArr[0];
+    msg[3] = RxArr[1];
+    msg[4] = SelfCRCCalc(msg);
+    break;
+\end{lstlisting}
+
+\subsection{UI application}
+On the SDK side the codes are applied with the existing setters, after a
+16-bit signed reconstruction that matches the Cortex little-endian load of
+an \texttt{int16\_t}:
+
+\begin{lstlisting}[style=cstyle,caption={UI dispatch for independent current references.}]
+case MC_PROTOCOL_CODE_SET_CURRENT_ID_REF: {
+    int16_t hIdRef = (int16_t)buffer[0]
+                   + ((int16_t)buffer[1] << 8);
+    UI_SetIdRef(&pHandle->_Super, hIdRef);
+    bNoError = true;
+} break;
+
+case MC_PROTOCOL_CODE_SET_CURRENT_IQ_REF: {
+    int16_t hIqRef = (int16_t)buffer[0]
+                   + ((int16_t)buffer[1] << 8);
+    UI_SetIqRef(&pHandle->_Super, hIqRef);
+    bNoError = true;
+} break;
+\end{lstlisting}
+
+No range check is performed at this layer. The Motor Control current
+regulators already saturate against the configured maximum; duplicating
+that saturation on the CAN boundary would have created two sources of
+truth. A NACK is returned only if the drive handle is invalid.
+
+\section{Torque ramp ($I_q$)}
+\label{sec:iq-ramp}
+
+The torque ramp was already present in the SDK as
+\texttt{MC\_PROTOCOL\_CODE\_SET\_TORQUE\_RAMP} /
+\texttt{UI\_ExecTorqueRamp}. What the original library lacked was the
+DYNO2DW case that forwards a CAN frame onto that code. The payload is
+six bytes: a 32-bit signed final $I_q$ and a 16-bit unsigned duration in
+milliseconds.
+
+\begin{lstlisting}[style=cstyle,caption={Torque-ramp translation and SDK dispatch.}]
+case SET_IQ_RAMP:
+    msg[0] = MC_PROTOCOL_CODE_SET_TORQUE_RAMP;
+    msg[1] = 0x06;
+    /* RxArr[0..3] = final Iq, RxArr[4..5] = duration */
+    ...
+    break;
+
+case MC_PROTOCOL_CODE_SET_TORQUE_RAMP: {
+    int32_t  torque   =  (int32_t)buffer[0]
+                      + ((int32_t)buffer[1] <<  8)
+                      + ((int32_t)buffer[2] << 16)
+                      + ((int32_t)buffer[3] << 24);
+    uint16_t duration =  (uint16_t)buffer[4]
+                      + ((uint16_t)buffer[5] << 8);
+    bNoError = UI_ExecTorqueRamp(&pHandle->_Super, torque, duration);
+} break;
+\end{lstlisting}
+
+A duration of zero means ``step'': the reference jumps in the next control
+period. Non-zero durations are converted, inside the speed/torque
+controller, into a number of ticks at \texttt{STCFrequencyHz} and into an
+increment per tick, exactly as the flux ramp does in the next section.
+
+\section{Flux ramp ($I_d$)}
+\label{sec:id-ramp}
+
+\subsection{A missing primitive}
+Unlike the torque ramp, a flux ramp did not exist. The SDK could set a
+constant $I_d$ and it could ramp $I_q$; it could not ramp $I_d$ over a
+specified time. That gap is visible in any flux-weakening characterisation
+and in any test that must enter or leave $I_d < 0$ without a step in
+magnetising current.
+
+The implementation therefore adds a protocol code,
+\texttt{MC\_PROTOCOL\_CODE\_SET\_FLUX\_RAMP}, a DYNO2DW case
+\texttt{SET\_ID\_RAMP} of length 6, and three new (weak) functions that
+mirror the torque-ramp call chain:
+
+\begin{center}
+\texttt{UI\_ExecFluxRamp} $\rightarrow$
+\texttt{MCI\_ExecFluxRamp} $\rightarrow$
+\texttt{STC\_ExecCurrentRamps}
+\end{center}
+
+\subsection{UI and MCI layers}
+The UI function is a thin selected-drive indirection. The MCI function
+records the request on the motor-control interface handle and marks it as
+not yet executed, so that the regular control-period task, rather than the
+CAN ISR, performs the numerical work.
+
+\begin{lstlisting}[style=cstyle,caption={UI and MCI entry points of the flux ramp.},label=lst:flux-ui]
+__weak bool UI_ExecFluxRamp(UI_Handle_t *pHandle,
+                            qd_t Vqd, uint16_t hDurationms)
+{
+    MCI_Handle_t *pMCI = pHandle->pMCI[pHandle->bSelectedDrive];
+    MCI_ExecFluxRamp(pMCI, Vqd, hDurationms);
+    return true;
+}
+
+__weak void MCI_ExecFluxRamp(MCI_Handle_t *pHandle,
+                             qd_t Iqdref, uint16_t hDurationms)
+{
+    pHandle->lastCommand   = MCI_EXECFLUXTRAMP;
+    pHandle->hFinalFlux    = Iqdref.d;
+    pHandle->hDurationms   = hDurationms;
+    pHandle->CommandState  = MCI_COMMAND_NOT_ALREADY_EXECUTED;
+}
+\end{lstlisting}
+
+\subsection{STC ramp law}
+The speed/torque controller stores flux in Q16 (the reference is
+multiplied by $2^{16}$). Given a current reference $I_d(0)$, a final value
+$I_d^\star$ and a duration $T$ in milliseconds, the number of remaining
+steps and the per-step increment are
+
+\begin{align}
+N &= \left\lfloor T \cdot f_{\mathrm{STC}} / 1000 \right\rfloor + 1, \\
+\Delta &= \frac{(I_d^\star - I_d(0)) \cdot 2^{16}}{N}.
+\end{align}
+
+If $T = 0$, the increment is zero and the Q16 reference is loaded
+immediately. The controller is switched to torque mode
+(\texttt{STC\_TORQUE\_MODE}) so that the outer speed loop cannot fight the
+current ramps. The same function updates the $I_q$ ramp when called from
+the torque path; the two axes share the duration-to-ticks conversion but
+keep separate remaining-step counters and separate increments
+(\texttt{RampRemainingStepId}, \texttt{IncDecAmountId}).
+
+\begin{lstlisting}[style=cstyle,caption={STC flux-ramp update (excerpt).},label=lst:stc]
+__weak bool STC_ExecCurrentRamps(SpeednTorqCtrl_Handle_t *pHandle,
+                                 int16_t hFinalFlux,
+                                 uint16_t hDurationms)
+{
+    int16_t hCurrentReferenceId = STC_GetFluxRef(pHandle);
+    STC_SetControlMode(pHandle, STC_TORQUE_MODE);
+
+    if (hDurationms == 0u) {
+        pHandle->FluxRef            = (int32_t)hFinalFlux * 65536;
+        pHandle->RampRemainingStepId = 0u;
+        pHandle->IncDecAmountId      = 0;
+    } else {
+        pHandle->TargetFinalId = hFinalFlux;
+        uint32_t wAux = (uint32_t)hDurationms
+                      * (uint32_t)pHandle->STCFrequencyHz;
+        wAux /= 1000u;
+        pHandle->RampRemainingStepId = wAux + 1u;
+        int32_t wAux1 = ((int32_t)hFinalFlux
+                       - (int32_t)hCurrentReferenceId) * 65536;
+        wAux1 /= (int32_t)pHandle->RampRemainingStepId;
+        pHandle->IncDecAmountId = wAux1;
+    }
+    return true;
+}
+\end{lstlisting}
+
+The DYNO2DW case that feeds this chain preserves the $I_q$ component of
+the current \texttt{qd\_t} pair---it reads \texttt{MCI\_GetIqdref},
+overwrites only \texttt{.d}, and then calls the ramp---so that commanding
+an $I_d$ ramp cannot accidentally zero $I_q$.
+
+\section{Packed PI register access}
+\label{sec:pi-pack}
+
+\subsection{The representation}
+The MCSDK does not store a floating-point $K_p$. It stores an integer
+numerator and a power-of-two divisor~\cite{astromhagglund2006,stmcsdk}:
+
+\begin{equation}
+K_p^{\mathrm{eff}} = \frac{K_p}{2^{n}}, \qquad
+K_i^{\mathrm{eff}} = \frac{K_i}{2^{m}}.
+\end{equation}
+
+\texttt{PID\_SetKP} writes $K_p$; \texttt{PID\_SetKPDivisorPOW2} writes
+$n$. A CAN consumer that can set only one of the two cannot reproduce a
+tuned loop, and a consumer that sets them in two messages can be
+preempted by a control period that sees a mixed pair.
+
+\subsection{The packing}
+A single 32-bit \texttt{wValue} therefore carries both halves:
+
+\begin{center}
+\begin{tabular}{cc}
+\toprule
+Bits 31--16 & Bits 15--0 \\
+\midrule
+divisor $n$ (unsigned) & gain $K_p$ (unsigned, used as signed 16-bit) \\
+\texttt{(wValue >> 16) \& 0xFFFF} & \texttt{wValue \& 0xFFFF} \\
+\texttt{PID\_SetKPDivisorPOW2()} & \texttt{PID\_SetKP()} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The same layout is used for $K_i$ and for the three loops (speed, flux,
+torque). Reading is the inverse operation, so a \texttt{GET\_REG} of
+\texttt{MC\_PROTOCOL\_REG\_SPEED\_KP} round-trips.
+
+\begin{lstlisting}[style=cstyle,caption={Packing and unpacking of SPEED\_KP.},label=lst:pi]
+/* UI_SetReg */
+case MC_PROTOCOL_REG_SPEED_KP: {
+    uint16_t kp_gain     = (uint16_t)(wValue & 0xFFFF);
+    uint16_t kp_div_pow2 = (uint16_t)(((uint32_t)wValue >> 16) & 0xFFFF);
+    PID_SetKP(pMCT->pPIDSpeed, (int16_t)kp_gain);
+    PID_SetKPDivisorPOW2(pMCT->pPIDSpeed, kp_div_pow2);
+} break;
+
+/* UI_GetReg */
+case MC_PROTOCOL_REG_SPEED_KP: {
+    bRetVal = ((int32_t)(PID_GetKPDivisor(pMCT->pPIDSpeed) & 0xFFFFu) << 16)
+            |  ((uint16_t)(PID_GetKP(pMCT->pPIDSpeed) & 0xFFFFu));
+} break;
+\end{lstlisting}
+
+The DBC exposes the two halves as two signals on the same message
+(\texttt{REGISTER\_VALUE}, \texttt{REGISTER\_VALUE\_DENOM}), so the GUI of
+\cref{ch:gui} can show ``Num / Den POW2'' without the operator doing the
+shifts. The firmware never sees those signal names; it only sees
+\texttt{wValue}.
+
+\section{Separating ACK/NACK from \texttt{GET\_REG}}
+\label{sec:ack}
+
+\subsection{The collision}
+Every well-formed command produces a response. A write produces a one-byte
+acknowledgement, \texttt{0xF0} for success and \texttt{0xFF} for failure.
+A read produces a four-byte register value. In the original library both
+responses were emitted under the same CAN identifier. A consumer that had
+just sent \texttt{GET\_REG} could not know whether the next frame was the
+value it asked for or an ACK from a previous write that had been delayed
+by bus arbitration. A consumer that had just sent \texttt{SET\_REG} could
+mistake a leftover \texttt{REG\_VALUE} for an ACK.
+
+\subsection{Dispatch on frame size}
+The FCP TX handler already knew the size of the frame it was serialising.
+That size is a reliable discriminant: acknowledgements are not four bytes,
+and register values are. The handler therefore sets the identifier to
+\texttt{0x10} by default and overrides it to \texttt{0x11} when
+\texttt{TxFrame.Size == 4}.
+
+\begin{lstlisting}[style=cstyle,caption={Identifier selection in CFCP\_TX\_IRQ\_Handler.},label=lst:ack]
+__weak void CFCP_TX_IRQ_Handler(CFCP_Handle_t *pHandle)
+{
+    if (FCP_TRANSFER_IDLE != pBaseHandle->TxFrameState) {
+        TxHeader.Identifier = CAN_TX_MSG_ID_START;   /* 0x10 */
+        if (pBaseHandle->TxFrame.Size == 4) {
+            TxHeader.Identifier = 17U;               /* 0x11 */
+        }
+        /* build tx_data[], submit to FDCAN */
+    }
+}
+\end{lstlisting}
+
+On the DBC side the same split is expressed as two messages,
+\texttt{ACK\_NACK} and \texttt{REG\_VALUE}. A further DBC defect---treating
+\texttt{0xF0} and \texttt{0xFF} themselves as identifiers---is repaired in
+\cref{ch:dbc}; it is mentioned here because it was a symptom of the same
+confusion between ``the code that means ACK'' and ``the identifier that
+carries it''.
+
+\section{Summary of firmware changes}
+\Cref{tab:dev-sum} collects the identifiers, codes and payload sizes that
+the rest of the thesis treats as the contract.
+
+\begin{table}[ht]
+\centering
+\caption{Firmware contract after the developments of this chapter.}
+\label{tab:dev-sum}
+\begin{tabular}{llll}
+\toprule
+CAN ID & Direction & FCP code / register & Payload \\
+\midrule
+\texttt{0x10} & MCU $\rightarrow$ dyno & ACK/NACK & 1 byte (\texttt{0xF0}/\texttt{0xFF}) \\
+\texttt{0x11} & MCU $\rightarrow$ dyno & \texttt{REG\_VALUE} & 4 bytes \\
+\texttt{0x31} & dyno $\rightarrow$ MCU & \texttt{SET\_REG} & id + packed value \\
+\texttt{0x32} & dyno $\rightarrow$ MCU & \texttt{GET\_REG} & register id \\
+\texttt{0x33} & dyno $\rightarrow$ MCU & \texttt{EXECUTE\_CMD} & bit-mask \\
+\texttt{0x37} & dyno $\rightarrow$ MCU & speed ramp & 6 bytes \\
+\texttt{0x3B} & dyno $\rightarrow$ MCU & $I_d$ ref & 2 bytes \\
+\texttt{0x3C} & dyno $\rightarrow$ MCU & $I_q$ ref & 2 bytes \\
+\texttt{0x3E} & dyno $\rightarrow$ MCU & $I_d$ ramp & 6 bytes \\
+\texttt{0x3F} & dyno $\rightarrow$ MCU & $I_q$ ramp & 6 bytes \\
+\texttt{0x40}+ & MCU $\rightarrow$ dyno & diagnostics & 4 bytes, period \SI{100}{\milli\second} \\
+\bottomrule
+\end{tabular}
+\end{table}

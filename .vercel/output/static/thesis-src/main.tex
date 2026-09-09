@@ -1,0 +1,318 @@
+% =============================================================================
+%  CAN Interface for the Automation of a Dynamometer Test Bench
+%  Master's thesis  —  Michele Imbarrato  —  SRA Lab, STMicroelectronics
+%
+%  Compile:  pdflatex main && bibtex main && pdflatex main && pdflatex main
+% =============================================================================
+\documentclass[11pt,a4paper,oneside,openany]{book}
+
+% ---------- encoding & fonts -------------------------------------------------
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage[english]{babel}
+
+% ---------- page geometry ----------------------------------------------------
+\usepackage[
+  a4paper,
+  top=30mm, bottom=30mm,
+  inner=30mm, outer=25mm,
+  headheight=14pt
+]{geometry}
+
+% ---------- microtypography --------------------------------------------------
+\usepackage{microtype}
+\usepackage{setspace}
+\onehalfspacing
+\setlength{\parskip}{0.35em}
+\setlength{\parindent}{1.2em}
+
+% ---------- mathematics ------------------------------------------------------
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{siunitx}
+\sisetup{detect-all,per-mode=symbol}
+
+% ---------- tables, figures, graphics ----------------------------------------
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{multirow}
+\usepackage{makecell}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{float}
+\graphicspath{{figures/}}
+\captionsetup{
+  font=small,
+  labelfont=bf,
+  skip=6pt
+}
+
+% ---------- lists & boxes ----------------------------------------------------
+\usepackage{enumitem}
+\usepackage[most]{tcolorbox}
+\usepackage{xcolor}
+
+\definecolor{NavyInk}{HTML}{1E3A5F}
+\definecolor{Paper}{HTML}{F4EFE6}
+\definecolor{CodeBg}{HTML}{F6F4EF}
+\definecolor{CodeRule}{HTML}{C9C1B4}
+\definecolor{AckGreen}{HTML}{2F6B4F}
+\definecolor{NackRed}{HTML}{8B2E2E}
+
+\tcbset{
+  colback=Paper,
+  colframe=NavyInk,
+  boxrule=0.4pt,
+  arc=1pt,
+  left=8pt, right=8pt, top=6pt, bottom=6pt,
+  fonttitle=\bfseries\sffamily
+}
+
+% ---------- code listings ----------------------------------------------------
+\usepackage{listings}
+\lstdefinestyle{cstyle}{
+  language=C,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\bfseries\color{NavyInk},
+  commentstyle=\itshape\color{black!50},
+  stringstyle=\color{AckGreen},
+  numbers=left,
+  numberstyle=\tiny\color{black!40},
+  numbersep=8pt,
+  frame=single,
+  rulecolor=\color{CodeRule},
+  backgroundcolor=\color{CodeBg},
+  breaklines=true,
+  showstringspaces=false,
+  tabsize=2,
+  captionpos=b,
+  xleftmargin=18pt,
+  framexleftmargin=18pt
+}
+\lstdefinestyle{caplstyle}{
+  language=C,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\bfseries\color{NavyInk},
+  commentstyle=\itshape\color{black!50},
+  numbers=left,
+  numberstyle=\tiny\color{black!40},
+  numbersep=8pt,
+  frame=single,
+  rulecolor=\color{CodeRule},
+  backgroundcolor=\color{CodeBg},
+  breaklines=true,
+  showstringspaces=false,
+  tabsize=2,
+  captionpos=b,
+  xleftmargin=18pt,
+  framexleftmargin=18pt,
+  morekeywords={on,sysvar,message,this,output,word}
+}
+\lstset{style=cstyle}
+
+% ---------- diagrams ---------------------------------------------------------
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,fit,shapes.geometric,chains}
+
+% ---------- headers / titles -------------------------------------------------
+\usepackage{fancyhdr}
+\usepackage[explicit]{titlesec}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\itshape\nouppercase{\leftmark}}
+\fancyhead[R]{\small\thepage}
+\renewcommand{\headrulewidth}{0.3pt}
+\fancypagestyle{plain}{%
+  \fancyhf{}%
+  \fancyfoot[C]{\thepage}%
+  \renewcommand{\headrulewidth}{0pt}%
+}
+
+\titleformat{\chapter}[display]
+  {\normalfont\bfseries\color{NavyInk}}
+  {\large\sffamily\MakeUppercase{\chaptertitlename}\ \thechapter}
+  {0.6em}
+  {\Huge #1}
+  [\vspace{0.4em}{\color{NavyInk}\titlerule[1.2pt]}]
+
+\titleformat{\section}
+  {\large\bfseries\color{NavyInk}}
+  {\thesection}
+  {0.8em}
+  {#1}
+
+\titleformat{\subsection}
+  {\normalsize\bfseries\color{NavyInk}}
+  {\thesubsection}
+  {0.7em}
+  {#1}
+
+% ---------- hyperref / cleveref (load last among layout pkgs) ----------------
+\usepackage[hyphens]{url}
+\usepackage[hidelinks]{hyperref}
+\usepackage[nameinlink,capitalise,noabbrev]{cleveref}
+
+\hypersetup{
+  pdftitle={CAN Interface for the Automation of a Dynamometer Test Bench},
+  pdfauthor={Michele Imbarrato},
+  pdfsubject={Master's Thesis, SRA Lab, STMicroelectronics},
+  colorlinks=true,
+  linkcolor=NavyInk,
+  citecolor=NavyInk,
+  urlcolor=NavyInk
+}
+
+% ---------- bibliography -----------------------------------------------------
+\usepackage[numbers,sort&compress]{natbib}
+\bibliographystyle{unsrtnat}
+
+% ---------- theorem-like environments ----------------------------------------
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}[chapter]
+\newtheorem{remark}{Remark}[chapter]
+
+% ---------- hyphenation ------------------------------------------------------
+\hyphenation{micro-con-trol-ler CANaly-zer Stel-lar dyna-mo-me-ter}
+
+% =============================================================================
+\begin{document}
+
+% ---------- title page -------------------------------------------------------
+\pagestyle{empty}
+\begin{titlepage}
+\centering
+\vspace*{8mm}
+
+{\sffamily\small\color{NavyInk} MASTER OF SCIENCE THESIS}\\[10mm]
+{\color{NavyInk}\rule{\textwidth}{1.1pt}}\\[8mm]
+{\Huge\bfseries\color{NavyInk}\raggedright
+ CAN Interface for the Automation of a Dynamometer Test Bench\par}
+\vspace{6mm}
+{\Large\itshape
+ Validation of the SR5E1 Motor-Control Library, Alignment of the CAN Database,
+ and Integration of an Operator Graphical Interface\par}
+\vspace{8mm}
+{\color{NavyInk}\rule{\textwidth}{0.4pt}}\\[12mm]
+
+{\large
+ Michele \textsc{Imbarrato}\\[2mm]
+ {\sffamily\small SRA Lab --- STMicroelectronics}}
+\vfill
+{\sffamily\small
+ Submitted in partial fulfilment of the requirements for the degree of\\
+ Master of Science in Electronic Engineering}\\[8mm]
+{\small
+ Academic year 2025/2026}\\[10mm]
+{\sffamily\footnotesize
+ Company supervisor: \textit{[to be completed]}\\
+ University supervisor: \textit{[to be completed]}\\
+ University / Department: \textit{[to be completed]}}
+\end{titlepage}
+
+% ---------- front matter -----------------------------------------------------
+\frontmatter
+\pagestyle{plain}
+\tableofcontents
+\clearpage
+\listoffigures
+\clearpage
+\listoftables
+\clearpage
+\lstlistoflistings
+\clearpage
+
+\chapter*{Abstract}
+\addcontentsline{toc}{chapter}{Abstract}
+The characterisation of traction inverters and electric machines on a
+dynamometer (dyno) test bench is a bottleneck in the development of modern
+electric-drive systems. Every start/stop command, speed or torque ramp,
+current reference and proportional--integral (PI) gain must reach the unit
+under test with deterministic timing, while a dense stream of diagnostics
+must travel in the opposite direction so that the operator---or an automated
+test script---can close the loop. When the unit under test is an
+STMicroelectronics Stellar-E (SR5E1) microcontroller running the Motor
+Control software development kit, that exchange is carried by a Controller
+Area Network (CAN) bus and by a translation layer historically called
+DYNO2DW (Dyno-to-Dishwasher), which maps bench-side CAN frames onto the
+internal ST Motor Control protocol.
+
+This thesis documents the complete rework of that interface. The existing
+SR5E1 CAN library was validated on the bench, and several defects---ambiguous
+command decoding, colliding response identifiers, incorrect packing of PI
+gains, and a mismatch between the documented Motor Control frame layout and
+the firmware implementation---were identified and corrected. The library was
+then extended with features required by automated characterisation:
+independent $I_d$/$I_q$ set-points, a flux ($I_d$) ramp that did not exist in
+the original stack, torque ($I_q$) ramps, and a compact 32-bit encoding that
+writes both a PI numerator and its power-of-two divisor in a single CAN
+message. A CAN database (DBC) was rewritten so that every identifier, layout
+and signal scaling matches the firmware, including a structural correction
+that turned the acknowledgement codes \texttt{0xF0} and \texttt{0xFF} from
+illegal message identifiers into payload values of a single response frame.
+Finally, a Python graphical user interface was connected to Vector CANalyzer
+through the Windows COM API, so that an operator can drive the inverter and
+observe telemetry without composing hexadecimal frames by hand.
+
+The resulting chain---firmware, DBC, CAPL and GUI---was verified with
+PCAN-View frame injection and Lauterbach TRACE32 source-level debugging.
+Periodic diagnostics (ten registers every \SI{100}{\milli\second}) are
+received reliably, commands are acknowledged on identifier \texttt{0x10} and
+register reads return on \texttt{0x11}, and the mutually exclusive
+start/stop/reset path no longer emits contradictory frames on the bus.
+
+\chapter*{Acknowledgements}
+\addcontentsline{toc}{chapter}{Acknowledgements}
+I wish to thank the engineers of the SRA Lab at STMicroelectronics for the
+opportunity to work on a production-relevant motor-control stack, for access
+to the dynamometer bench, and for the TRACE32 and Vector toolchains that made
+the validation possible. I am equally grateful to the academic supervisor who
+followed this work, and to colleagues who reviewed early versions of the DBC
+and of the operator interface.
+
+\chapter*{List of Abbreviations}
+\addcontentsline{toc}{chapter}{List of Abbreviations}
+\begin{tabularx}{\textwidth}{@{}lX@{}}
+\toprule
+\textbf{ACK/NACK} & Positive / negative acknowledgement \\
+\textbf{CAN}      & Controller Area Network (ISO~11898) \\
+\textbf{CAN FD}   & CAN with Flexible Data-rate \\
+\textbf{CAPL}     & Communication Access Programming Language (Vector) \\
+\textbf{COM}      & Component Object Model (Microsoft) \\
+\textbf{DBC}      & CAN database (Vector \texttt{.dbc} format) \\
+\textbf{DLC}      & Data Length Code \\
+\textbf{DYNO2DW}  & Dyno-to-Dishwasher translation layer \\
+\textbf{FDCAN}    & Flexible Data-rate CAN peripheral (ST) \\
+\textbf{FOC}      & Field-Oriented Control \\
+\textbf{GUI}      & Graphical User Interface \\
+\textbf{ISR}      & Interrupt Service Routine \\
+\textbf{MCSDK}    & ST Motor Control Software Development Kit \\
+\textbf{MCU}      & Microcontroller Unit \\
+\textbf{PI}       & Proportional--Integral (controller) \\
+\textbf{PMSM}     & Permanent-Magnet Synchronous Machine \\
+\textbf{UUT}      & Unit Under Test \\
+\bottomrule
+\end{tabularx}
+
+% ---------- main matter ------------------------------------------------------
+\mainmatter
+\pagestyle{fancy}
+
+\include{chapters/01_introduction}
+\include{chapters/02_background}
+\include{chapters/03_architecture}
+\include{chapters/04_developments}
+\include{chapters/05_validation}
+\include{chapters/06_dbc}
+\include{chapters/07_gui}
+\include{chapters/08_conclusions}
+
+\appendix
+\include{chapters/A_listings}
+
+% ---------- bibliography -----------------------------------------------------
+\backmatter
+\bibliography{thesis}
+
+\end{document}

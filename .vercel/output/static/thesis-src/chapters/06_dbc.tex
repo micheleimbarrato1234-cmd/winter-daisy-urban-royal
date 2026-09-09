@@ -1,0 +1,178 @@
+\chapter{The CAN Database}
+\label{ch:dbc}
+
+A DBC file is the human-readable contract of the bus~\cite{vectordbc}.
+This chapter describes the DBC that was brought into alignment with the
+firmware of \cref{ch:dev}: the message tree, two representative signal
+layouts, the offset convention, the reserved window for new commands, and
+the structural correction of ACK/NACK.
+
+\section{Role of the DBC in this project}
+Without a DBC, CANalyzer displays identifiers and hex dumps. With a DBC it
+displays ``heatsink temperature, \SI{47.3}{\celsius}'' and it can encode a
+speed ramp from two physical fields, \emph{final speed in RPM} and
+\emph{duration in ms}. The Python GUI of \cref{ch:gui} never packs a
+CAN frame itself; it writes system variables, CAPL reads those variables,
+and CANalyzer encodes the frame from the DBC. It follows that a DBC which
+disagrees with the firmware is not a documentation issue. It is a
+functional bug in the operator path.
+
+The file therefore defines, for every message,
+
+\begin{itemize}[leftmargin=1.6em]
+  \item the 11-bit identifier;
+  \item the DLC in bytes;
+  \item each signal's start bit, length, signedness, endianness, factor,
+        offset and unit;
+  \item a comment that names the matching firmware symbol where one
+        exists.
+\end{itemize}
+
+\section{Message tree}
+\label{sec:tree}
+
+The DBC is organised in three branches, visible in CANalyzer's
+symbol explorer (\cref{fig:dbc-tree}).
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.72\textwidth]{dbc_tree.png}
+\caption{DBC message tree as shown by CANalyzer. Diagnostics occupy
+\texttt{0x40}--\texttt{0x60}; motor-control commands occupy
+\texttt{0x30}--; MCU responses occupy \texttt{0x10} and \texttt{0x11}.}
+\label{fig:dbc-tree}
+\end{figure}
+
+\paragraph{Diagnostics, \texttt{0x40}--\texttt{0x60}.}
+Ten periodic messages, one per register of \cref{tab:diag-map}. Each has
+DLC~4 and a single 32-bit little-endian signal. Factors convert the SDK's
+internal units into volts, degrees Celsius, milliamperes or RPM so that
+the GUI never sees raw ticks.
+
+\paragraph{Motor-control commands, \texttt{0x30}--.}
+\texttt{SET\_REG}, \texttt{GET\_REG}, \texttt{EXECUTE\_COMMAND},
+\texttt{SET\_RAMP}, the paired and independent current commands, and the
+two current ramps. Layouts are message-specific: a bit-mask, a pair of
+physical values, a packed PI word.
+
+\paragraph{MCU responses, \texttt{0x10} and \texttt{0x11}.}
+\texttt{ACK\_NACK} and \texttt{REG\_VALUE}. These two messages are the
+DBC counterpart of \cref{lst:ack}.
+
+\section{Two representative layouts}
+\label{sec:layouts}
+
+\subsection{\texttt{EXECUTE\_COMMAND} (identifier \texttt{0x33})}
+The payload is a bit-mask spread over two bytes. Each flag is a 1-bit
+signal with factor~1, so CAPL and the GUI can write
+\texttt{msg.EXE\_START\_MOTOR = 1} without shifting. The bit positions
+match \cref{tab:exec-flags}. Unused bits are present in the DBC as
+reserved signals; they are transmitted as zero and ignored on reception,
+which is what makes a later extension of the mask binary-compatible.
+
+\subsection{\texttt{SET\_RAMP} (identifier \texttt{0x37})}
+Two physical signals share the eight-byte payload:
+
+\begin{itemize}[leftmargin=1.6em]
+  \item \texttt{FinalSpeed\_execrmp} --- signed, little-endian, factor
+        chosen so that the GUI unit is RPM;
+  \item \texttt{Duration\_execrmp} --- unsigned, little-endian, unit
+        milliseconds.
+\end{itemize}
+
+The same pattern---final value plus duration---is reused for
+\texttt{SET\_ID\_RAMP} and \texttt{SET\_IQ\_RAMP}, with the final-value
+signal scaled in milliamperes rather than RPM. Reusing the pattern is a
+deliberate invitation to reuse CAPL: the speed-ramp event handler of
+\cref{lst:capl-speed} has a current-ramp twin that differs only in the
+message type.
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.95\textwidth]{dbc_signals.png}
+\caption{Signal-level view of a DBC message in CANalyzer. Start bit,
+length, factor and offset are the fields that must match the firmware's
+little-endian packing.}
+\label{fig:dbc-signals}
+\end{figure}
+
+\section{Alignment with the $+$\texttt{0x30}/$+$\texttt{0x40} rule}
+\label{sec:dbc-offset}
+
+The DBC was rewritten so that a reader who knows the firmware offset rule
+of \cref{sec:offset} can predict every identifier, and a reader who knows
+the DBC can predict every firmware code. Three ranges result.
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Range & Role & Origin \\
+\midrule
+\texttt{0x10}--\texttt{0x11} & MCU responses & size-based dispatch, \cref{sec:ack} \\
+\texttt{0x30}--\texttt{0x3A} & original commands & firmware library as found \\
+\texttt{0x3B}--\texttt{0x3C} & \texttt{SET\_CURRENT\_ID} / \texttt{IQ} & added in this work \\
+\texttt{0x3E}--\texttt{0x3F} & $I_d$ / $I_q$ ramps & $I_q$ existing, $I_d$ added \\
+\texttt{0x40}-- & diagnostics & \texttt{Send\_Status} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\texttt{SET\_CURRENT\_ID} and \texttt{SET\_CURRENT\_IQ} illustrate the one
+place where the naive offset was not used. The protocol codes
+\texttt{0x0F} and \texttt{0x11} would have mapped to \texttt{0x3F} and
+\texttt{0x41}. The first collides with \texttt{SET\_IQ\_RAMP}; the second
+sits inside the diagnostic window. Unused identifiers \texttt{0x3B} and
+\texttt{0x3C} were therefore assigned in both the DBC and the C
+\texttt{switch}, and a comment in each artefact points at the other. The
+offset rule remains the default; collisions are resolved by an explicit
+exception, never by silent reuse.
+
+\section{Structural correction of ACK/NACK}
+\label{sec:dbc-ack}
+
+The original DBC declared two messages with identifiers \texttt{0xF0} and
+\texttt{0xFF}. Those values are the \emph{payload} of an acknowledgement,
+not CAN identifiers: they do not fit in 11 bits without being interpreted
+as a different, extended-id convention, and they never appeared on the
+wire as identifiers. CANalyzer therefore never decoded a real ACK, and
+any CAPL handler attached to those messages was dead code.
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.55\textwidth]{ack_before.png}
+\caption{Original DBC fragment in which \texttt{0xFF} (NACK) and
+\texttt{0xF0} (ACK) are declared as distinct CAN identifiers. Both values
+are in fact payload codes of the single message \texttt{0x10}.}
+\label{fig:ack-before}
+\end{figure}
+
+The repair is a single message \texttt{ACK\_NACK} at identifier
+\texttt{0x10}, DLC~1, with one unsigned 8-bit signal
+\texttt{AckCode}. A value table maps \texttt{0xF0} $\mapsto$
+\texttt{ACK} and \texttt{0xFF} $\mapsto$ \texttt{NACK}. Identifier
+\texttt{0x11} remains \texttt{REG\_VALUE}, with two 16-bit signals
+\texttt{GET\_K\_NUMERATOR} and \texttt{GET\_K\_DENOMINATOR} that mirror
+the packing of \cref{sec:pi-pack} for PI reads, and a 32-bit raw signal
+for every other register.
+
+After this change, a CAPL \texttt{on message ACK\_NACK} handler fires on
+every write, and a CAPL \texttt{on message REG\_VALUE} handler fires on
+every read. The Python GUI polls the corresponding system variables and
+never has to look at identifiers.
+
+\section{Keeping the DBC honest}
+A DBC drifts as soon as a firmware identifier is added without a matching
+edit. The working rule adopted at the end of this project is
+mechanical and small:
+
+\begin{itemize}[leftmargin=1.6em]
+  \item no firmware identifier ships without a DBC message of the same
+        name and DLC;
+  \item no DBC signal ships without a comment that names the C symbol or
+        the bit it corresponds to;
+  \item a PCAN-View trace of a newly added message is attached to the
+        laboratory notebook before the GUI is allowed to send it.
+\end{itemize}
+
+Those three checks would have caught both the ACK-as-identifier mistake
+and the SET\_REG length-byte mistake before either reached an operator.

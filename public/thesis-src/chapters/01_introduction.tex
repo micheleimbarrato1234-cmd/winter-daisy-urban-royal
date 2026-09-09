@@ -1,0 +1,149 @@
+\chapter{Introduction}
+\label{ch:intro}
+
+\section{Motivation}
+The electrification of traction, industrial actuation and household appliances
+has shifted a large fraction of product validation from the vehicle or the
+appliance itself onto the dynamometer bench. A dyno can impose a controlled
+mechanical load, record shaft torque and speed, and---when coupled to an
+inverter---exercise the full current, flux and speed loops of a
+field-oriented controller~\cite{isermann2014engine,krishnan2010pmsm}. The
+value of that facility, however, is only as high as the quality of the
+digital interface that binds the bench software to the unit under test
+(UUT).
+
+In the laboratory that hosted this work, the UUT is an STMicroelectronics
+Stellar-E microcontroller of the SR5E1 family~\cite{ststellar}, running the
+Motor Control software development kit (MCSDK)~\cite{stmcsdk}. The physical
+link is a CAN (and CAN FD) bus~\cite{iso11898,bosch1991can}. Historically,
+bench commands were translated into the internal ST Motor Control protocol
+by a firmware layer named DYNO2DW---``Dyno to Dishwasher''---a name that
+betrays the appliance origin of the protocol profile. The layer was
+functional enough for manual bring-up, but it was not a contract that a
+test automation engineer could trust: identifiers collided, a single
+\texttt{EXECUTE\_COMMAND} frame could request both start and stop, PI gains
+could not be written atomically, $I_d$ and $I_q$ could not be ramped
+independently, and the DBC file that Vector CANalyzer used to decode the bus
+had drifted away from the C implementation.
+
+The practical consequence is easy to state. An operator who wants to sweep
+speed from $0$ to $n^\star$ in $T$ milliseconds, hold a torque-producing
+current $I_q$, detune the speed PI, and log heatsink temperature, should
+press four well-labelled controls---not compose eight hexadecimal frames
+while watching a trace window. Closing that gap is the subject of this
+thesis.
+
+\section{Problem statement}
+Three artefacts must stay consistent if a CAN-based dyno interface is to be
+automatable:
+
+\begin{enumerate}[leftmargin=1.6em]
+  \item the \emph{firmware} that unpacks incoming frames, calls the Motor
+        Control API, and emits diagnostics;
+  \item the \emph{DBC} that names every identifier, places every signal and
+        documents every scale factor;
+  \item the \emph{operator surface}---here Vector CANalyzer plus a Python
+        GUI---that hides those identifiers behind physical units.
+\end{enumerate}
+
+At the start of the project none of the three was in that state. The SR5E1
+CAN library implemented a subset of the Motor Control protocol, with
+offset-based identifier mapping ($+$\texttt{0x30} for commands,
+$+$\texttt{0x40} for diagnostics) that had never been fully reconciled with
+the DBC. Reception lived in an interrupt service routine and was therefore
+difficult to inspect without a hardware debugger. Transmission of the
+periodic status stack was coupled to the Frame Communication Protocol (FCP)
+state machine in a way that silently dropped updates when the transmitter
+was busy. Several protocol codes required by the bench---independent $I_d$
+and $I_q$ references, a flux ramp, packed PI writes---were either missing or
+wired to the wrong identifier.
+
+\section{Objectives}
+The work was organised around three objectives, corresponding to the three
+artefacts above.
+
+\paragraph{O1 --- Validate and correct the SR5E1 CAN library.}
+Exercise every incoming command and every outgoing diagnostic on hardware.
+Prove, with TRACE32 breakpoints and PCAN-View traces, that each CAN
+identifier maps onto the intended Motor Control call. Remove contradictory
+control paths and colliding response identifiers.
+
+\paragraph{O2 --- Rebuild the DBC so that it is a faithful dictionary of the
+bus.}
+Add the new messages required by O1, enforce the $+$\texttt{0x30}/$+$\texttt{0x40}
+offset convention, and correct the structural error that treated
+acknowledgement codes as CAN identifiers rather than payload values.
+
+\paragraph{O3 --- Provide an operator GUI on top of Vector CANalyzer.}
+Use CAPL and the CANalyzer COM API so that a Python interface can start and
+stop the motor, program speed and current ramps, tune PI gains and plot
+telemetry, without exposing hexadecimal layouts to the user.
+
+\section{Contributions}
+The concrete contributions of this thesis are the following.
+
+\begin{itemize}[leftmargin=1.6em]
+  \item A documented architecture of the DYNO2DW translation layer, including
+        the offset rule, the ten-message diagnostic stack and the
+        transmission/reception call graph
+        (\cref{ch:arch}).
+  \item A mutually exclusive rewrite of \texttt{EXECUTE\_COMMAND} that
+        cannot emit both \texttt{START\_MOTOR} and \texttt{STOP\_MOTOR} for
+        the same frame, together with a clean handling of reset, fault
+        acknowledgement and encoder alignment (\cref{ch:dev}).
+  \item Independent $I_d$ and $I_q$ set-points
+        (\texttt{MC\_PROTOCOL\_CODE\_SET\_CURRENT\_ID\_REF},
+        \texttt{MC\_PROTOCOL\_CODE\_SET\_CURRENT\_IQ\_REF}) and a newly
+        implemented flux ramp (\texttt{UI\_ExecFluxRamp} /
+        \texttt{MCI\_ExecFluxRamp} / \texttt{STC\_ExecCurrentRamps}) that
+        mirrors the existing torque ramp (\cref{ch:dev}).
+  \item A 32-bit packing convention for PI registers, so that a single
+        \texttt{SET\_REG} writes both $K_p$ (or $K_i$) and its
+        power-of-two divisor (\cref{ch:dev}).
+  \item Separation of ACK/NACK (identifier \texttt{0x10}, payload
+        \texttt{0xF0}/\texttt{0xFF}) from the \texttt{GET\_REG} response
+        (identifier \texttt{0x11}), implemented in
+        \texttt{CFCP\_TX\_IRQ\_Handler} by dispatching on frame size
+        (\cref{ch:dev}).
+  \item A case study of a specification-versus-implementation discrepancy:
+        in the SR5E1 library, byte~0 of a \texttt{SET\_REG} frame is the
+        register identifier, not a length field as the dishwasher protocol
+        document suggests (\cref{ch:val}).
+  \item A DBC aligned on the firmware, with a corrected acknowledgement
+        message and a reserved identifier window for new commands
+        (\cref{ch:dbc}).
+  \item A Python GUI, driven through \texttt{win32com.client}, covering
+        motor start/stop, speed ramps, PI panels, $I_d$/$I_q$ control and
+        live charts, with CAPL-side ready-flags that prevent incomplete
+        multi-parameter frames from reaching the bus (\cref{ch:gui}).
+\end{itemize}
+
+\section{Methodology}
+The work followed a closed-loop debug methodology rather than a
+spec-first rewrite. Each defect was first reproduced on the bench by
+injecting a CAN frame with PCAN-View over a PCAN-USB FD adapter. The
+corresponding FDCAN interrupt was then trapped in Lauterbach TRACE32, so
+that payload unpacking, the DYNO2DW switch statement, the Motor Control
+call and the TX response could be observed on a single stepping path.
+Only after a behaviour was understood in that environment was the C
+source---or the DBC, or the CAPL---changed. The GUI was introduced last,
+once the bus contract was stable, because an operator surface that sits on
+a moving DBC is more expensive to maintain than a hexadecimal injector.
+
+This ordering is deliberate. In embedded protocol work, the firmware is the
+source of truth: a DBC that disagrees with the MCU will decode the bus
+wrongly, and a GUI that disagrees with the DBC will send frames the MCU
+silently nacks. Keeping that hierarchy explicit is, in itself, one of the
+engineering results of the project.
+
+\section{Structure of the thesis}
+\Cref{ch:bg} reviews the technical background that a reader needs in order
+to follow the rest of the text: CAN and CAN FD, DBC files, field-oriented
+control of PMSM machines, the Stellar-E platform and the ST Motor Control
+SDK, and the role of a dynamometer bench. \Cref{ch:arch} describes the
+legacy SR5E1 CAN library as it was found. \Cref{ch:dev} presents the
+firmware developments. \Cref{ch:val} reports the hardware validation
+campaign and the protocol-discrepancy case study. \Cref{ch:dbc} documents
+the DBC rebuild. \Cref{ch:gui} describes the CANalyzer--Python integration
+and the operator panels. \Cref{ch:conc} summarises the results and outlines
+future work. An appendix collects the longer firmware and CAPL listings.

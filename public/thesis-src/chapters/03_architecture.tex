@@ -1,0 +1,267 @@
+\chapter{The Existing SR5E1 CAN Library}
+\label{ch:arch}
+
+This chapter describes the library as it was found: the offset convention
+that maps Motor Control codes onto CAN identifiers, the periodic diagnostic
+stack, the transmission and reception paths, and the command map. Defects
+are noted where they affect the reading of the code; the repairs themselves
+are postponed to \cref{ch:dev}.
+
+\section{Architectural overview}
+\label{sec:arch-overview}
+
+The library is an adapter. On one side is the dynamometer software, which
+speaks a flat set of 11-bit CAN identifiers. On the other side is the ST
+Motor Control SDK, which speaks the Frame Communication Protocol recalled
+in \cref{sec:mcp}. Between them sits \texttt{DYNO2DWProtocol}, a translation
+function invoked from the FDCAN receive interrupt.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[
+  font=\sffamily\small,
+  box/.style={draw=NavyInk, rounded corners=1.5pt, align=center,
+              inner sep=7pt, minimum height=12mm, minimum width=32mm},
+  arr/.style={-{Latex}, thick, NavyInk}
+]
+  \node[box, fill=Paper] (dyno) {Dyno bench\\software};
+  \node[box, fill=Paper, right=18mm of dyno] (xlate)
+    {DYNO2DW\\{\scriptsize identifier $\leftrightarrow$ FCP}};
+  \node[box, fill=Paper, right=18mm of xlate] (fw)
+    {Stellar-E firmware\\{\scriptsize ST MC protocol}};
+  \draw[arr] (dyno) -- node[above, font=\scriptsize] {CAN $+$\texttt{0x30}}
+                        node[below, font=\scriptsize] {commands} (xlate);
+  \draw[arr] (xlate) -- node[above, font=\scriptsize] {Code, Len,}\\
+                        node[below, font=\scriptsize] {Payload, CRC} (fw);
+  \draw[arr] ([yshift=-7mm]fw.south) -- ++(0,-7mm) -|
+             node[near start, below, font=\scriptsize] {diagnostics $+$\texttt{0x40}}
+             ([yshift=-7mm]dyno.south);
+\end{tikzpicture}
+\caption{Role of the DYNO2DW translation layer. Commands travel dyno
+$\rightarrow$ MCU with an identifier offset of $+$\texttt{0x30}; diagnostics
+travel MCU $\rightarrow$ dyno with an offset of $+$\texttt{0x40}.}
+\label{fig:arch}
+\end{figure}
+
+The adapter is deliberately thin. It does not implement a second motor
+controller and it does not keep a shadow copy of the PI gains. It unpacks
+a CAN frame, builds an FCP frame, and hands it to
+\texttt{CFCP\_RX\_IRQ\_Handler}. Status in the other direction is read with
+\texttt{UI\_GetReg} and emitted as raw 4-byte little-endian values under
+the diagnostic identifiers.
+
+\section{The offset rule}
+\label{sec:offset}
+
+Two constants structure the identifier map.
+
+\begin{definition}[Command offset]
+An incoming command whose Motor Control code is $c$ is published on the
+bus as identifier $c + \mathtt{0x30}$.
+\end{definition}
+
+\begin{definition}[Diagnostic offset]
+An outgoing diagnostic whose Motor Control register identifier is $r$ is
+published on the bus as identifier $r + \mathtt{0x40}$.
+\end{definition}
+
+The constants are not arbitrary. They park the command window in
+\texttt{0x30}--\texttt{0x3F} and the diagnostic window in
+\texttt{0x40}--\texttt{0x60}, leaving \texttt{0x10}--\texttt{0x11} free for
+MCU responses (ACK/NACK and \texttt{REG\_VALUE}) and avoiding collision
+with the very lowest identifiers, which many toolchains reserve. The same
+rule is what later allowed unused command slots such as \texttt{0x3B} and
+\texttt{0x3C} to be claimed for independent $I_d$/$I_q$ writes without
+renumbering the rest of the map.
+
+\begin{remark}
+The offset is applied to the \emph{protocol code}, not to an arbitrary
+enum. When a new Motor Control code is introduced---for example
+\texttt{MC\_PROTOCOL\_CODE\_SET\_CURRENT\_ID\_REF = 0x0F}---its CAN
+identifier is implied: $\mathtt{0x0F}+\mathtt{0x30}=\mathtt{0x3F}$. In
+practice a collision check against the diagnostic window and against
+already assigned commands is still required; that is why the DBC chapter
+records \texttt{0x3B}/\texttt{0x3C} as the identifiers actually shipped
+for the independent current commands, reserving the ``naive'' offset
+values where they would have overlapped existing ramps.
+\end{remark}
+
+\section{Periodic diagnostics: \texttt{Send\_Status}}
+\label{sec:send-status}
+
+The dyno must observe the inverter without polling. The library therefore
+emits a stack of ten diagnostic frames every \SI{100}{\milli\second}, from
+a function named \texttt{Send\_Status}. The registers in the stack are:
+
+\begin{center}
+\begin{tabular}{cll}
+\toprule
+Index & Register macro & Physical meaning \\
+\midrule
+0 & \texttt{MC\_PROTOCOL\_REG\_UNDEFINED} & Sequence counter \\
+1 & \texttt{MC\_PROTOCOL\_REG\_SPEED\_REF} & Speed reference \\
+2 & \texttt{MC\_PROTOCOL\_REG\_TORQUE\_REF} & $I_q$ reference \\
+3 & \texttt{MC\_PROTOCOL\_REG\_FLUX\_REF} & $I_d$ reference \\
+4 & \texttt{MC\_PROTOCOL\_REG\_BUS\_VOLTAGE} & DC-link voltage \\
+5 & \texttt{MC\_PROTOCOL\_REG\_HEATS\_TEMP} & Heatsink temperature \\
+6 & \texttt{MC\_PROTOCOL\_REG\_SPEED\_MEAS} & Measured speed \\
+7 & \texttt{MC\_PROTOCOL\_REG\_TORQUE\_MEAS} & Measured $I_q$ \\
+8 & \texttt{MC\_PROTOCOL\_REG\_FLUX\_MEAS} & Measured $I_d$ \\
+9 & \texttt{MC\_PROTOCOL\_REG\_STATUS} & Machine state \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Each iteration of the loop reads one register through
+\texttt{UI\_GetReg}, packs the 32-bit value as four little-endian bytes,
+assigns the identifier $r + \mathtt{0x40}$, and submits the frame with
+\texttt{DBCCAN\_TX\_IRQ\_Handler}. Submission is gated on
+\texttt{FCP\_TRANSFER\_IDLE}: if the TX path is still busy from the
+previous frame, the entire stack is skipped for that period. That
+back-pressure rule is conservative---it prefers silence over a torn
+update---and it is one of the reasons the validation in \cref{ch:val}
+starts by confirming that ten identifiers really do appear, in order,
+every \SI{100}{\milli\second}.
+
+The resulting diagnostic identifiers, after the offset, are collected in
+\cref{tab:diag-map}. They are the same identifiers the GUI plots in
+\cref{ch:gui}.
+
+\begin{table}[ht]
+\centering
+\caption{Outgoing diagnostic identifiers (offset $+$\texttt{0x40}).}
+\label{tab:diag-map}
+\begin{tabular}{lll}
+\toprule
+ID & Name & Content \\
+\midrule
+\texttt{0x42} & \texttt{DIAG\_STATE\_MC}     & Machine status \\
+\texttt{0x44} & \texttt{DIAG\_SPEED\_REF}    & Speed reference \\
+\texttt{0x48} & \texttt{DIAG\_TORQUE\_REF}   & $I_q$ reference \\
+\texttt{0x4C} & \texttt{DIAG\_FLUX\_REF}     & $I_d$ reference \\
+\texttt{0x59} & \texttt{DIAG\_BUS\_VOLTAGE}  & DC-link voltage \\
+\texttt{0x5A} & \texttt{DIAG\_TEMPERATURE}   & Heatsink temperature \\
+\texttt{0x5E} & \texttt{DIAG\_SPEED\_MEAS}   & Measured speed \\
+\texttt{0x5F} & \texttt{DIAG\_TORQUE\_MEAS}  & Measured $I_q$ \\
+\texttt{0x60} & \texttt{DIAG\_FLUX\_MEAS}    & Measured $I_d$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Transmission path}
+\label{sec:tx}
+
+For a single diagnostic frame the TX path is four steps.
+
+\begin{enumerate}[leftmargin=1.6em]
+  \item \texttt{UI\_GetReg(\&pHandle->\_Super, Register, NULL)} returns a
+        signed 32-bit value. For PI registers the value is already packed
+        as described in \cref{sec:pi-pack}; for physical quantities it is
+        the SDK's internal representation (RPM, \si{\milli\ampere},
+        \si{\milli\volt}, \si{\celsius}, \ldots).
+  \item The four data bytes are written little-endian into the FDCAN TX
+        buffer. Little-endian matches both the Cortex-R52 memory order and
+        the convention used by Vector tools on Intel hosts, so a DBC signal
+        of type \texttt{unsigned Motorola} would be wrong here.
+  \item The identifier is set to the register identifier plus
+        \texttt{0x40}.
+  \item \texttt{DBCCAN\_TX\_IRQ\_Handler} submits the buffer to the FDCAN
+        peripheral. Hardware then performs arbitration and acknowledgement
+        autonomously.
+\end{enumerate}
+
+Command responses---ACK/NACK and \texttt{GET\_REG} values---take a
+slightly different path, through \texttt{CFCP\_TX\_IRQ\_Handler}. That
+handler is where the original library used a single identifier for both
+kinds of response; the defect and its repair are in \cref{sec:ack}.
+
+\section{Reception path}
+\label{sec:rx}
+
+Reception is entirely interrupt-driven.
+
+\begin{enumerate}[leftmargin=1.6em]
+  \item Hardware raises \texttt{IRQ\_CAN1\_LINE0\_HANDLER} on a matching
+        identifier.
+  \item The ISR copies the payload into \texttt{RxArr[]} and calls
+        \texttt{DYNO2DWProtocol}.
+  \item The function switches on the command code implied by the
+        identifier (\texttt{EXECUTE\_COMMAND}, \texttt{SET\_RAMP},
+        \texttt{SET\_REG}, \ldots), writes \texttt{msg[0]} (FCP code),
+        \texttt{msg[1]} (length) and the payload bytes, then appends
+        \texttt{msg[n] = SelfCRCCalc(msg)}.
+  \item Each byte of \texttt{msg[]} is fed to
+        \texttt{CFCP\_RX\_IRQ\_Handler}, which advances the FCP state
+        machine and, on a complete well-checksummed frame, dispatches into
+        the Motor Control UI layer.
+\end{enumerate}
+
+Timeouts live in the FCP layer, not in DYNO2DW: an interrupted multi-byte
+feed is abandoned so that a later command cannot be parsed as the tail of
+an earlier one. This is the correct behaviour on a bus that may drop a
+frame, but it makes the ISR path sensitive to the order and completeness
+of the \texttt{msg[]} construction. Several of the bugs repaired in
+\cref{ch:dev} were, at bottom, bugs in that construction---a length byte
+that did not match the payload, a command that wrote \texttt{msg[]} twice,
+a CRC computed before the payload was filled.
+
+\section{Command map}
+\label{sec:cmd-map}
+
+\Cref{tab:cmd-map} lists the incoming commands as documented at the
+beginning of the project. Identifiers follow the $+$\texttt{0x30} rule
+except where a later collision forced a reassignment; those exceptions are
+discussed with the corresponding feature in \cref{ch:dev}.
+
+\begin{table}[ht]
+\centering
+\caption{Incoming command identifiers (offset $+$\texttt{0x30}).}
+\label{tab:cmd-map}
+\begin{tabular}{llp{70mm}}
+\toprule
+ID & Command & Role \\
+\midrule
+\texttt{0x31} & \texttt{SET\_REG}            & Write a Motor Control register \\
+\texttt{0x32} & \texttt{GET\_REG}            & Read a Motor Control register \\
+\texttt{0x33} & \texttt{EXECUTE\_COMMAND}    & Start, stop, reset, align, \ldots \\
+\texttt{0x37} & \texttt{SET\_RAMP}           & Speed ramp (final value, duration) \\
+\texttt{0x3A} & \texttt{SET\_CURRENT\_ID\_IQ}& Simultaneous $I_d$ and $I_q$ \\
+\texttt{0x3B} & \texttt{SET\_CURRENT\_ID}    & Independent $I_d$ reference \\
+\texttt{0x3C} & \texttt{SET\_CURRENT\_IQ}    & Independent $I_q$ reference \\
+\texttt{0x3E} & \texttt{SET\_ID\_RAMP}       & Flux ($I_d$) ramp \\
+\texttt{0x3F} & \texttt{SET\_IQ\_RAMP}       & Torque ($I_q$) ramp \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\texttt{EXECUTE\_COMMAND} is a bit-mask, not a single enumerated action.
+Byte~0 carries \texttt{EXE\_START\_MOTOR}, \texttt{STOP\_RAMP},
+\texttt{RESET}, \texttt{EXE\_PING}, \texttt{FAULT\_ACK} and
+\texttt{ENCODER\_ALIGN}; byte~1 carries \texttt{EXE\_IQDREF\_CLEAR} and
+\texttt{GET\_BOARD\_INFO}. The original decoder treated those flags with a
+chain of independent \texttt{if} statements, which is the first defect
+repaired in the next chapter.
+
+\section{What the original library did not provide}
+\label{sec:gaps}
+
+A short list, so that Chapter~\ref{ch:dev} can be read as a closing of
+named gaps rather than as a tour of unrelated patches.
+
+\begin{itemize}[leftmargin=1.6em]
+  \item \textbf{Unambiguous machine commands.} Start and stop could be
+        requested together; the last write to \texttt{msg[2]} won, and a
+        second FCP frame could still be emitted for reset.
+  \item \textbf{Independent current axes.} $I_d$ and $I_q$ could be written
+        as a pair; they could not be written, or ramped, separately with
+        first-class protocol codes.
+  \item \textbf{A flux ramp.} The torque ramp existed in the SDK
+        (\texttt{UI\_ExecTorqueRamp}). The flux ramp did not; it had to be
+        added through the UI, MCI and STC layers.
+  \item \textbf{Atomic PI updates.} Numerator and divisor travelled in
+        ways that a single \texttt{SET\_REG} could not express.
+  \item \textbf{Distinguishable responses.} ACK/NACK and
+        \texttt{GET\_REG} shared an identifier.
+\end{itemize}
+
+Those five items are the body of \cref{ch:dev}.

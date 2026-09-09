@@ -1,0 +1,36 @@
+{
+  "url": "http://127.0.0.1:8080/source",
+  "viewports": {
+    "desktop": {
+      "width": 1280,
+      "height": 800,
+      "status": 200,
+      "title": "CAN Thesis",
+      "hasCanvas": false,
+      "bodyTextLen": 11028,
+      "bodyTextHash": "2abbc4d75e0f538f26a8f1bcf2ddc8be1c0c4dc96b88014d5519408b6ec1756c",
+      "bodyTextPrefix": "LaTeX source main.tex Copy Zip README.md main.tex thesis.bib 01_",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/source.png"
+    },
+    "mobile": {
+      "width": 390,
+      "height": 844,
+      "status": 200,
+      "title": "CAN Thesis",
+      "hasCanvas": false,
+      "bodyTextLen": 11019,
+      "bodyTextHash": "7c15a44f511990dceb9ab1d1917ba6fd8b62385067a48b852b1832000b82b5c5",
+      "bodyTextPrefix": "LaTeX source main.tex README.md main.tex thesis.bib 01_introduct",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/source-mobile.png"
+    }
+  },
+  "brandWarnings": [],
+  "authWarnings": [],
+  "verdictFile": "/workspace/screenshots/source.json"
+}

@@ -1,0 +1,222 @@
+\chapter{Validation and Debugging}
+\label{ch:val}
+
+Firmware that has only been compiled has not been validated. This chapter
+reports the hardware campaign that was used both to find the defects of
+\cref{ch:dev} and to confirm that the repairs hold on the bus. The
+method is deliberately low-level: PCAN-View injects frames, the SR5E1
+raises an FDCAN interrupt, TRACE32 steps through \texttt{DYNO2DWProtocol},
+and PCAN-View records the response.
+
+\section{Debug chain}
+\label{sec:debug-chain}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[
+  font=\sffamily\footnotesize,
+  box/.style={draw=NavyInk, rounded corners=1.5pt, align=center,
+              inner sep=6pt, minimum height=11mm, minimum width=28mm},
+  arr/.style={-{Latex}, thick, NavyInk}
+]
+  \node[box, fill=Paper] (pcan) {1. Frame injection\\PCAN-USB FD};
+  \node[box, fill=Paper, right=12mm of pcan] (isr)
+    {2. FDCAN IRQ\\Stellar-E};
+  \node[box, fill=Paper, right=12mm of isr] (t32)
+    {3. TRACE32 step\\DYNO2DWProtocol()};
+  \node[box, fill=Paper, right=12mm of t32] (ack)
+    {4. Bus response\\0x10 / 0x11};
+  \draw[arr] (pcan) -- (isr);
+  \draw[arr] (isr) -- (t32);
+  \draw[arr] (t32) -- (ack);
+\end{tikzpicture}
+\caption{Closed-loop debug path from a synthetic CAN frame to the
+acknowledgement observed on the same bus.}
+\label{fig:debug-chain}
+\end{figure}
+
+The four steps of \cref{fig:debug-chain} were applied to every command in
+\cref{tab:cmd-map}.
+
+\paragraph{Frame injection.}
+A PCAN-USB FD adapter, driven by PCAN-View~\cite{pcanview}, transmits a
+frame with a chosen identifier, DLC and payload. \Cref{fig:pcan-tx} shows
+the transmit list used during the campaign: \texttt{EXECUTE\_COMMAND}
+(\texttt{0x33}), \texttt{SET\_REG} (\texttt{0x31}), \texttt{GET\_REG}
+(\texttt{0x32}), the speed ramp, the current commands, and a handful of
+diagnostic identifiers configured as receive filters.
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.82\textwidth]{pcan_tx.png}
+\caption{PCAN-View transmit list used for command injection. Each row is a
+hand-composed CAN frame with identifier, DLC and payload bytes.}
+\label{fig:pcan-tx}
+\end{figure}
+
+\paragraph{Interrupt.}
+Arrival of a filtered identifier raises
+\texttt{IRQ\_CAN1\_LINE0\_HANDLER} on the SR5E1. TRACE32 is programmed
+with a breakpoint on the first instruction of
+\texttt{DYNO2DWProtocol}, so the core halts with the payload already in
+\texttt{RxArr[]}.
+
+\paragraph{Step-by-step execution.}
+From that breakpoint the engineer can watch the construction of
+\texttt{msg[]}, the CRC, the call into \texttt{CFCP\_RX\_IRQ\_Handler},
+and the Motor Control function that ultimately runs
+(\texttt{UI\_SetReg}, \texttt{UI\_SetIdRef}, \texttt{MCI\_ExecFluxRamp},
+\ldots). This is also how the SET\_REG discrepancy of
+\cref{sec:discrepancy} was diagnosed: the first payload byte that the
+specification called a length was being used as a register identifier,
+and the TRACE32 locals window made that obvious in one step.
+
+\paragraph{Response.}
+On resume, the MCU publishes either identifier \texttt{0x10} with payload
+\texttt{0xF0} (ACK) or \texttt{0xFF} (NACK), or identifier \texttt{0x11}
+with a four-byte register value. PCAN-View records the frame; a mismatch
+against the expected identifier or payload is a failed test.
+
+\section{Physical layer and periodic diagnostics}
+\label{sec:phys}
+
+Before any command was trusted, the TX path was checked in isolation. With
+the motor idle and no frames being injected, PCAN-View was configured to
+log the diagnostic window \texttt{0x40}--\texttt{0x60}. The expected
+behaviour, from \cref{sec:send-status}, is ten frames every
+\SI{100}{\milli\second}.
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.88\textwidth]{pcan_rx.png}
+\caption{PCAN-View trace of MCU-to-dyno traffic. Identifier \texttt{0x10}
+carries ACK/NACK; identifier \texttt{0x11} carries \texttt{REG\_VALUE};
+the remaining identifiers are the periodic diagnostic stack.}
+\label{fig:pcan-rx}
+\end{figure}
+
+The trace in \cref{fig:pcan-rx} confirms three properties at once.
+
+\begin{enumerate}[leftmargin=1.6em]
+  \item The physical layer, the bit-rate and the termination are correct:
+        frames arrive without error frames and without ACK-slot errors.
+  \item \texttt{Send\_Status} is running at the designed period. Counting
+        the ten diagnostic identifiers between two occurrences of the
+        sequence counter is a direct measurement of the \SI{100}{\milli\second}
+        tick.
+  \item The ACK/NACK identifier \texttt{0x10} and the \texttt{REG\_VALUE}
+        identifier \texttt{0x11} are distinct, which is the observable
+        counterpart of \cref{lst:ack}.
+\end{enumerate}
+
+A board that fails this test is not ready for command injection. Several
+early bring-up failures---wrong bit-rate, missing 120~$\Omega$
+termination, TX FIFO left in a non-idle state---were caught here, in
+minutes, rather than inside TRACE32.
+
+\section{Command-by-command tracking}
+\label{sec:tracking}
+
+For each command the same protocol was followed: inject, halt, step,
+resume, compare. The notes below are the ones that changed the code.
+
+\begin{itemize}[leftmargin=1.6em]
+  \item \texttt{EXECUTE\_COMMAND 0x33}. The original start/stop complement
+        was visible as a \texttt{STOP\_MOTOR} FCP frame being built for a
+        CAN payload that had only \texttt{FAULT\_ACK} set. After the
+        rewrite of \cref{sec:exec}, a payload with a single flag produces
+        a single FCP frame with the matching \texttt{MC\_PROTOCOL\_CMD\_*}
+        code.
+  \item \texttt{SET\_RAMP 0x37}. Duration and final speed are unpacked
+        little-endian; swapping the 16-bit duration bytes is a common
+        DBC error and was caught here before the DBC was declared frozen.
+  \item \texttt{SET\_CURRENT\_ID / IQ}. The 16-bit signed reconstruction
+        was checked with the values \texttt{0x00E8} ($+232$) and
+        \texttt{0xFF18} ($-232$) to confirm sign extension.
+  \item \texttt{SET\_REG 0x31}. See the next section; this is the case
+        that disagreed with the written protocol.
+  \item PI round-trip. A \texttt{SET\_REG} of \texttt{SPEED\_KP} with
+        numerator $N$ and divisor $n$, followed by a \texttt{GET\_REG} of
+        the same register, returned the packed word
+        $(n \ll 16) \mid N$ on identifier \texttt{0x11}.
+\end{itemize}
+
+\section{Case study: SET\_REG versus the dishwasher specification}
+\label{sec:discrepancy}
+
+The Motor Control protocol document~\cite{stmcprotocol} describes
+\texttt{SET\_REG} as a length-prefixed frame: byte~0 is the payload
+length, byte~1 is the register identifier, the following bytes are the
+value. The SR5E1 library, as written and as executed, does something else.
+Byte~0 of the CAN payload \emph{is} the register identifier. There is no
+length byte on the wire; the FCP length is inserted by DYNO2DW when it
+builds \texttt{msg[]}.
+
+\begin{figure}[ht]
+\centering
+\begin{minipage}[t]{0.48\textwidth}
+  \centering
+  \includegraphics[width=\textwidth]{setreg_pcan.png}
+  \captionof{figure}{SET\_REG frame as transmitted from PCAN-View.
+  Byte~0 of the payload is already the target register identifier.}
+  \label{fig:setreg-pcan}
+\end{minipage}\hfill
+\begin{minipage}[t]{0.48\textwidth}
+  \centering
+  \includegraphics[width=\textwidth]{dw_spec.png}
+  \captionof{figure}{SET\_REG layout in the dishwasher protocol
+  specification, with a length byte in front of the register identifier.}
+  \label{fig:dw-spec}
+\end{minipage}
+\end{figure}
+
+TRACE32 made the disagreement uncontroversial. Halting in the
+\texttt{SET\_REG} case showed \texttt{RxArr[0]} being copied into the
+register-id argument of \texttt{UI\_SetReg}, not into \texttt{msg[1]}
+as a length. A frame built according to the specification---length first---
+wrote the wrong register and returned a NACK or, worse, a silent write
+to an unintended PI gain.
+
+Two equally defensible repairs were available: change the firmware to
+match the document, or document the firmware and change the DBC. The
+second option was taken, for three reasons.
+
+\begin{enumerate}[leftmargin=1.6em]
+  \item The library was already deployed on boards that the dyno spoke to.
+        Changing the on-wire layout would have broken those boards and
+        every recorded trace.
+  \item DYNO2DW exists specifically to absorb this kind of difference: the
+        FCP frame, with its length byte and CRC, is an internal MCU
+        affair. The CAN payload can be denser.
+  \item The DBC is the contract the GUI and the dyno software compile. Once
+        it says ``byte~0 is \texttt{REGISTER\_ID}'', both consumers are
+        right together.
+\end{enumerate}
+
+The episode is recorded at this length because it is the standard failure
+mode of protocol work: two artefacts that each look consistent, and a bus
+that cannot tell them apart until a debugger sits on both sides of the
+ISR.
+
+\section{What was considered passing}
+\label{sec:pass-criteria}
+
+A command was marked validated when all of the following held on hardware.
+
+\begin{itemize}[leftmargin=1.6em]
+  \item The TRACE32 locals showed the intended FCP code, length and
+        payload, and a CRC that \texttt{SelfCRCCalc} accepted.
+  \item The Motor Control function associated with that code executed
+        (verified by a breakpoint on the function itself, not only on
+        DYNO2DW).
+  \item The bus showed identifier \texttt{0x10} with \texttt{0xF0} for
+        writes, or identifier \texttt{0x11} with the expected four-byte
+        value for reads.
+  \item A second, malformed variant of the same command (truncated DLC,
+        reserved flag set, out-of-range register id) produced
+        \texttt{0xFF} and did not change machine state.
+\end{itemize}
+
+The GUI of \cref{ch:gui} was not used as an oracle during this campaign.
+It was connected only after the DBC matched the traces, so that a widget
+bug could not be mistaken for a firmware bug.

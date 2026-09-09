@@ -1,0 +1,36 @@
+{
+  "url": "http://127.0.0.1:8080/read",
+  "viewports": {
+    "desktop": {
+      "width": 1280,
+      "height": 800,
+      "status": 200,
+      "title": "CAN Thesis",
+      "hasCanvas": false,
+      "bodyTextLen": 28294,
+      "bodyTextHash": "ea77b18776f4389da342da61b2ff36575fadce1100f49abb29b83eb11c72d583",
+      "bodyTextPrefix": "CAN Thesis Michele Imbarrato Source LaTeX zip CONTENTS Front mat",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/read.png"
+    },
+    "mobile": {
+      "width": 390,
+      "height": 844,
+      "status": 200,
+      "title": "CAN Thesis",
+      "hasCanvas": false,
+      "bodyTextLen": 27738,
+      "bodyTextHash": "3a14501482b2e716b70684cec66830feb4da1cfcf7ad840eecc4fac5d6d2989a",
+      "bodyTextPrefix": "CAN Thesis MASTER OF SCIENCE THESIS CAN Interface for the Automa",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/read-mobile.png"
+    }
+  },
+  "brandWarnings": [],
+  "authWarnings": [],
+  "verdictFile": "/workspace/screenshots/read.json"
+}

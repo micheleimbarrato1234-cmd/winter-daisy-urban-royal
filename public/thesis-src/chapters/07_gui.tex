@@ -1,0 +1,262 @@
+\chapter{CANalyzer Integration and Operator GUI}
+\label{ch:gui}
+
+Once the firmware and the DBC agreed, the remaining problem was human.
+Composing hexadecimal frames in PCAN-View is the right way to validate a
+protocol and the wrong way to run a characterisation campaign. This
+chapter describes the operator surface that was built on top of Vector
+CANalyzer: a CAPL layer that owns the real-time bus, a COM API that
+exports system variables, and a Python GUI that owns widgets, gauges and
+plots.
+
+\section{Partition of responsibilities}
+\label{sec:partition}
+
+Python is a poor real-time CAN stack. Vector CANalyzer is a poor widget
+toolkit. The architecture of \cref{fig:gui-arch} takes that observation
+literally.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[
+  font=\sffamily\footnotesize,
+  box/.style={draw=NavyInk, rounded corners=1.5pt, align=center,
+              inner sep=6pt, minimum height=12mm},
+  arr/.style={-{Latex}, thick, NavyInk}
+]
+  \node[box, fill=Paper, minimum width=24mm] (mcu) {Stellar-E\\FDCAN};
+  \node[box, fill=Paper, minimum width=28mm, right=12mm of mcu]
+    (capl) {CANalyzer\\DBC + CAPL};
+  \node[box, fill=Paper, minimum width=28mm, right=12mm of capl]
+    (com) {COM API\\sysvars};
+  \node[box, fill=Paper, minimum width=24mm, right=12mm of com]
+    (py) {Python GUI\\widgets};
+  \draw[arr] (mcu) -- node[above, font=\scriptsize] {CAN} (capl);
+  \draw[arr] (capl) -- (com);
+  \draw[arr] (com) -- (py);
+  \draw[arr, dashed] ([yshift=-6mm]py.south) -- ++(0,-5mm) -|
+    node[near start, below, font=\scriptsize] {write sysvar}
+    ([yshift=-6mm]capl.south);
+\end{tikzpicture}
+\caption{Operator-path architecture. CANalyzer owns timing, DBC encoding
+and CAPL; Python owns the graphical interface and talks only to system
+variables via \texttt{win32com.client}.}
+\label{fig:gui-arch}
+\end{figure}
+
+On startup the Python process instantiates
+\texttt{Vector.CANalyzer.Application} through \texttt{win32com.client}
+\cite{win32com} and obtains the \texttt{App.SystemVariables} namespace.
+From that moment on, two directions of traffic exist.
+
+\paragraph{Bus $\rightarrow$ GUI.}
+Firmware emits the ten diagnostic frames and, when asked, a
+\texttt{REG\_VALUE}. CAPL \texttt{on message} handlers decode them with
+the DBC and write system variables. Python polls those variables on a
+timer and refreshes gauges, numeric fields and plots.
+
+\paragraph{GUI $\rightarrow$ bus.}
+A button, a slider or a ``Set'' action writes one or more system
+variables. A CAPL \texttt{on sysvar} handler wakes, checks the ready
+flags described below, fills a typed message and calls
+\texttt{output()}. CANalyzer encodes the frame from the DBC and
+transmits it.
+
+Python never calls a CAN driver. That single restriction is what makes
+the GUI interchangeable: a future operator surface in C\# or in CAPL
+panels themselves would reuse the same system variables and the same
+DBC.
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.95\textwidth]{canalyzer.png}
+\caption{Vector CANalyzer during a session, with the system-variable
+namespace that the Python GUI reads and writes through the COM API.}
+\label{fig:canalyzer}
+\end{figure}
+
+\section{Ready flags for multi-parameter commands}
+\label{sec:ready}
+
+A speed ramp has two parameters. If the GUI wrote \texttt{SET\_RAMP = 1}
+the moment the operator touched either field, the frame on the bus would
+carry a stale duration or a stale final speed. The CAPL layer therefore
+keeps three variables per multi-parameter command:
+
+\begin{itemize}[leftmargin=1.6em]
+  \item a physical value (\texttt{g\_finalSpeed\_value},
+        \texttt{g\_durSpeed\_value});
+  \item a ready flag per value (\texttt{is\_finalSpeed\_ready},
+        \texttt{is\_durSpeed\_ready});
+  \item a trigger (\texttt{SET\_SPEED\_RAMP::SET\_RAMP}).
+\end{itemize}
+
+The trigger fires the handler; the handler transmits only when every
+ready flag is one. The same pattern is used for current ramps and for PI
+writes (numerator and divisor). Incomplete edits stay in the GUI and off
+the bus.
+
+\begin{lstlisting}[style=caplstyle,caption={CAPL handler for the speed ramp, with ready-flag guard.},label=lst:capl-speed]
+on sysvar SET_SPEED_RAMP::SET_RAMP
+{
+  message SET_RAMP msgSpeedRamp;
+
+  if (@this == 1 &&
+      is_finalSpeed_ready == 1 &&
+      is_durSpeed_ready   == 1)
+  {
+    msgSpeedRamp.FinalSpeed_execrmp = g_finalSpeed_value;
+    msgSpeedRamp.Duration_execrmp   = g_durSpeed_value;
+    output(msgSpeedRamp);
+  }
+}
+\end{lstlisting}
+
+PI writes are factored into a helper, because three loops times two gains
+would otherwise copy the same three assignments nine times:
+
+\begin{lstlisting}[style=caplstyle,caption={CAPL helper that encodes a packed PI SET\_REG.},label=lst:capl-pi]
+void send_pi_message(word reg_id, int val, int denom)
+{
+  message SET_REG msg;
+  msg.REGISTER_ID           = reg_id;
+  msg.REGISTER_VALUE        = val;
+  msg.REGISTER_VALUE_DENOM  = denom;
+  output(msg);
+}
+\end{lstlisting}
+
+\section{Telemetry handlers}
+\label{sec:tel-capl}
+
+On the inbound side, CAPL is a set of trivial assignments. The DBC has
+already unpacked the frame; the handler's only job is to copy the
+physical value into a system variable that Python will poll.
+
+\begin{lstlisting}[style=caplstyle,caption={Inbound CAPL: diagnostics and REG\_VALUE.},label=lst:capl-diag]
+on message DIAG_TORQUE_REF
+{
+  @DIAG_MESSAGES::TORQUE_REF = this.DWord(0);
+}
+
+on message REG_VALUE
+{
+  @GET_REG::K_num = this.GET_K_NUMERATOR;
+  @GET_REG::K_den = this.GET_K_DENOMINATOR;
+}
+\end{lstlisting}
+
+Using \texttt{this.DWord(0)} for the raw diagnostic payload is
+intentional. Factors and units are applied either in the DBC signal
+definition (when the GUI wants physical units) or in Python (when a plot
+needs a custom scale). They are never applied in both places.
+
+\section{Operator panels}
+\label{sec:panels}
+
+The GUI is organised as a connection banner plus four tabs. The banner is
+always visible: a CAN-bus indicator, a machine-state field, heatsink
+temperature, DC-link voltage, and the start / stop / reset-fault
+controls. Putting those controls outside the tabs is a safety choice. An
+operator who is looking at a PI panel can still stop the motor without
+changing tab.
+
+\subsection{Motor control panel}
+\Cref{fig:gui-overview} is the first surface the operator sees. Start and
+stop map onto the \texttt{EXECUTE\_COMMAND} flags of
+\cref{tab:exec-flags}. Temperature and DC-link voltage are bound to
+\texttt{DIAG\_TEMPERATURE} and \texttt{DIAG\_BUS\_VOLTAGE}. Machine state
+is bound to \texttt{DIAG\_STATE\_MC}; the reset-fault button sets
+\texttt{FAULT\_ACK}.
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.95\textwidth]{gui_overview.png}
+\caption{Motor control panel. Connection status, start/stop, thermal and
+DC-link readouts, machine state and fault reset live in the top banner
+so they remain reachable from every tab.}
+\label{fig:gui-overview}
+\end{figure}
+
+\subsection{Speed control}
+The speed tab (\cref{fig:gui-speed}) exposes the two parameters of
+\texttt{SET\_RAMP}: final speed in RPM and ramp duration in milliseconds,
+plus an apply button that is the trigger of \cref{lst:capl-speed}. A
+gauge shows the reference (\texttt{DIAG\_SPEED\_REF}) against the
+measured speed (\texttt{DIAG\_SPEED\_MEAS}) so that a ramp in progress is
+visible without reading a plot.
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.95\textwidth]{gui_speed.png}
+\caption{Speed-control tab. The operator sets a final speed and a
+duration; the gauge compares reference and actual RPM in real time.}
+\label{fig:gui-speed}
+\end{figure}
+
+\subsection{PI controller}
+The PI tab (\cref{fig:gui-pi}) is a direct view of
+\cref{sec:pi-pack}. Three groups---speed, flux, torque---each offer $K_p$
+and $K_i$ as a numerator and a power-of-two divisor. ``Set'' calls
+\texttt{send\_pi\_message} with the corresponding register identifier.
+``Read'' issues \texttt{GET\_REG} and fills the same fields from
+\texttt{REG\_VALUE}, which is how an operator confirms that a write
+round-tripped.
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.95\textwidth]{gui_pi.png}
+\caption{PI-controller tab. Each of the three loops exposes $K_p$ and
+$K_i$ as a numerator / $2^n$ pair, matching the packed 32-bit register
+layout.}
+\label{fig:gui-pi}
+\end{figure}
+
+\subsection{Current control}
+The current tab (\cref{fig:gui-current}) is the operator counterpart of
+\cref{sec:id-iq,sec:iq-ramp,sec:id-ramp}. $I_q$ and $I_d$ can be written
+as instantaneous set-points or as ramps with their own durations. Two
+strip charts show reference against measurement for each axis, which is
+the quantity a current-loop tuning session actually looks at.
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.95\textwidth]{gui_current.png}
+\caption{Current-control tab. Independent $I_q$ and $I_d$ set-points and
+ramps, with live plots of reference and measured current on each axis.}
+\label{fig:gui-current}
+\end{figure}
+
+\subsection{Live charts}
+The last tab (\cref{fig:gui-charts}) repeats the speed gauge and the two
+current plots at a larger size, without the entry fields. It is the
+surface used once a test is running and the operator's job is to watch,
+not to command.
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.95\textwidth]{gui_charts.png}
+\caption{Live-charts tab: speed overview together with the $I_q$
+(torque) and $I_d$ (flux) current plots.}
+\label{fig:gui-charts}
+\end{figure}
+
+\section{What the GUI does not do}
+A short negative list, because the temptation to grow an operator surface
+into a second dyno controller is strong and was resisted.
+
+\begin{itemize}[leftmargin=1.6em]
+  \item The GUI does not implement a safety PLC. Emergency stop remains a
+        hardware input to the inverter and to the dyno.
+  \item The GUI does not log to disk. CANalyzer already records traces in
+        a format that the rest of the laboratory toolchain consumes.
+  \item The GUI does not re-implement DBC packing. If a signal scale is
+        wrong, the fix is in the DBC, not in a Python constant.
+  \item The GUI does not talk to the MCU except through CANalyzer. There
+        is no second CAN adapter in the Python process, so there is no
+        second source of frames to debug.
+\end{itemize}
+
+Those restrictions are what keep the three-artefact rule of
+\cref{ch:intro} intact: firmware, DBC, operator surface, in that order of
+authority.

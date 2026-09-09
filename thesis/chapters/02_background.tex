@@ -1,0 +1,247 @@
+\chapter{Technical Background}
+\label{ch:bg}
+
+This chapter fixes the vocabulary used in the rest of the thesis. Nothing
+here is a contribution; everything here is required in order to read the
+implementation chapters without a pile of footnotes.
+
+\section{Controller Area Network}
+\label{sec:can}
+
+The Controller Area Network is a multi-master, message-oriented serial bus
+originally specified by Bosch and now standardised as
+ISO~11898~\cite{bosch1991can,iso11898,voss2008can}. Nodes do not address
+each other; they publish \emph{frames} that carry an identifier, a data
+payload and a cyclic redundancy check. Arbitration is bitwise and
+non-destructive: the identifier with the most dominant bits wins, so
+priority is encoded in the identifier itself. That property is the reason
+automotive and industrial control systems still prefer CAN over
+point-to-point links when a modest amount of data must be shared among many
+nodes with bounded latency~\cite{navet2005can}.
+
+A classical CAN 2.0 frame carries up to 8~bytes of payload and an 11-bit
+(standard) or 29-bit (extended) identifier. CAN FD~\cite{iso11898fd} keeps
+the same arbitration phase and then switches to a higher bit-rate for the
+data phase, with payloads of up to 64~bytes. The SR5E1 Stellar-E
+microcontroller implements an FDCAN peripheral that is source-compatible
+with both. In this project the physical layer was operated as CAN~2.0 with
+11-bit identifiers: the diagnostic and command payloads used here fit in
+eight bytes, and the dyno software at the far end of the cable was
+configured for that mode. The firmware drivers, however, go through the
+FDCAN HAL, so a later migration to CAN FD is a configuration change rather
+than a protocol redesign.
+
+Two protocol facts matter for everything that follows.
+
+\begin{enumerate}[leftmargin=1.6em]
+  \item \textbf{The identifier \emph{is} the message.} There is no
+        connection handshake and no session. A node that wants to start the
+        motor publishes identifier \texttt{0x33}; a node that wants to
+        report heatsink temperature publishes identifier \texttt{0x5A}.
+        Receivers filter on identifiers. This is why a DBC file, which
+        binds names and layouts to identifiers, is not documentation on the
+        side---it is the only human-readable contract the bus has.
+  \item \textbf{Payload layout is convention, not syntax.} CAN does not
+        know about integers, physical units or byte order. Little-endian
+        packing of a 32-bit speed in RPM, a 16-bit current in
+        \si{\milli\ampere}, or a 32-bit PI word that concatenates a gain
+        and a divisor, is entirely a matter of agreement between producer
+        and consumer. Break that agreement and the bus still ``works'':
+        frames are acknowledged at the data-link layer, while the
+        application reads garbage.
+\end{enumerate}
+
+\section{CAN databases (DBC)}
+\label{sec:dbc-bg}
+
+A DBC file is the de-facto industry dictionary for a CAN
+bus~\cite{vectordbc}. For every message it records
+
+\begin{itemize}[leftmargin=1.6em]
+  \item the identifier and the data length code (DLC);
+  \item a list of signals, each with start bit, length, byte order,
+        signedness, factor, offset, range and unit;
+  \item optional value tables, multiplexors and comments.
+\end{itemize}
+
+Tools such as Vector CANalyzer~\cite{vectorcanalyzer} compile the DBC and
+use it in both directions: incoming frames are decoded into physical
+signals (``heatsink is \SI{47.3}{\celsius}''), and outgoing signals are
+encoded into frames. If the DBC is wrong, the GUI is wrong, even when the
+firmware is right. Chapter~\ref{ch:dbc} is, in that sense, as important as
+the C changes in Chapter~\ref{ch:dev}.
+
+A recurring design choice in this project is to treat the firmware as
+authoritative and the DBC as a generated-looking projection of it. Offsets
+of $+$\texttt{0x30} and $+$\texttt{0x40}, described in
+\cref{ch:arch}, exist precisely so that a reader of either artefact can
+predict the other.
+
+\section{Field-oriented control of PMSM machines}
+\label{sec:foc}
+
+Permanent-magnet synchronous machines are controlled, in the ST Motor
+Control SDK as in most industrial drives, by field-oriented control
+(FOC)~\cite{park1929,leonhard1996foc,krishnan2010pmsm}. Stator currents
+are transformed into a rotor-aligned $dq$ frame in which
+
+\begin{itemize}[leftmargin=1.6em]
+  \item $I_d$ is the flux-producing current,
+  \item $I_q$ is the torque-producing current.
+\end{itemize}
+
+In the linear region, electromagnetic torque is proportional to $I_q$
+(and, with reluctance torque, to a cross term in $I_d I_q$). Flux weakening
+at high speed is obtained by commanding a negative $I_d$. The two currents
+are regulated by inner PI loops; an outer PI loop on mechanical speed (or
+on torque) produces the $I_q$ reference. PWM of the inverter legs
+then synthesises the corresponding stator voltages~\cite{holmes2003pwm}.
+
+Three consequences for the CAN interface follow directly from this
+structure.
+
+\begin{enumerate}[leftmargin=1.6em]
+  \item Independent $I_d$ and $I_q$ references are not a luxury. Characterisation
+        of the machine---identification of flux maps, of $L_d$ and $L_q$, of
+        iron-loss maps---requires holding one axis while sweeping the other.
+        A protocol that can only write the pair $(I_d,I_q)$ atomically is
+        already useful; a protocol that can also ramp each axis on its own
+        schedule is what a dyno actually needs.
+  \item Ramps are a safety and a physics feature. A step of $I_q$ is a step
+        of torque; on a dyno with a finite mechanical bandwidth it produces
+        a torsional shock. Speed ramps and current ramps, parameterised by
+        a final value and a duration in milliseconds, are therefore
+        first-class commands, not cosmetic.
+  \item PI gains are dimensioned as a numerator and a power-of-two
+        divisor~\cite{astromhagglund2006}. The MCSDK stores
+        $K_p$ as an integer together with
+        \texttt{KPDivisorPOW2}, so that the effective gain is
+        $K_p / 2^{n}$. Exposing only $K_p$ over CAN would make the
+        closed-loop behaviour impossible to reconstruct; exposing both in
+        two messages would make atomic updates impossible. The packing
+        described in \cref{sec:pi-pack} is the resulting compromise.
+\end{enumerate}
+
+\section{The Stellar-E SR5E1 platform}
+\label{sec:stellar}
+
+Stellar-E is STMicroelectronics' automotive microcontroller family built
+around Arm Cortex-R52 cores, with a functional-safety architecture aimed at
+ISO~26262 applications~\cite{ststellar}. The SR5E1 device used on the bench
+provides one or more FDCAN controllers, a rich timer set for PWM
+generation, analog peripherals for current and voltage sensing, and a debug
+port that Lauterbach TRACE32 can attach to. From the point of view of this
+thesis the relevant properties are pedestrian and essential:
+
+\begin{itemize}[leftmargin=1.6em]
+  \item incoming CAN frames raise an interrupt
+        (\texttt{IRQ\_CAN1\_LINE0\_HANDLER} in the project sources);
+  \item outgoing frames are submitted to the FDCAN TX FIFO from a software
+        handler (\texttt{DBCCAN\_TX\_IRQ\_Handler} /
+        \texttt{CFCP\_TX\_IRQ\_Handler});
+  \item the Motor Control SDK is linked as a set of weakly-defined
+        \texttt{\_\_weak} functions, which is what made it possible to add
+        \texttt{UI\_ExecFluxRamp} and the PI packing without forking the
+        whole library.
+\end{itemize}
+
+The ``dishwasher'' qualifier that appears throughout the code is historical.
+ST's Motor Control SDK ships application profiles---among them an appliance
+profile originally demonstrated on a dishwasher drum motor. The register
+map, the command codes and the Frame Communication Protocol (FCP) used by
+that profile were reused as the internal language of the dyno interface.
+DYNO2DW is the adapter between that language and the identifier map that
+the bench already spoke.
+
+\section{ST Motor Control protocol and FCP}
+\label{sec:mcp}
+
+The internal protocol is a short, length-prefixed, checksummed frame:
+
+\begin{center}
+\texttt{[Code : 1 byte][Length : 1 byte][Payload : Length bytes][CRC : 1 byte]}
+\end{center}
+
+\texttt{Code} selects an operation (\texttt{EXECUTE\_CMD}, \texttt{SET\_REG},
+\texttt{GET\_REG}, set-ramp, set-current, \ldots). \texttt{Length} is the
+payload size, not the total frame size. The CRC is computed by
+\texttt{SelfCRCCalc} over the preceding bytes. On the MCU the reconstructed
+bytes are pushed, one by one, into
+\texttt{CFCP\_RX\_IRQ\_Handler}, which implements the Frame Communication
+Protocol state machine, including inter-byte timeouts. On the way out,
+\texttt{CFCP\_TX\_IRQ\_Handler} serialises a response: either a 1-byte
+acknowledgement or a 4-byte register value.
+
+Two observations, both of which will reappear as bugs in
+\cref{ch:val,ch:dev}, follow from this layout.
+
+\begin{itemize}[leftmargin=1.6em]
+  \item The CAN payload is \emph{not} identical to the FCP frame. DYNO2DW
+        is a translator: it reads a CAN identifier and a raw 8-byte buffer,
+        and it \emph{builds} the FCP frame in a local array \texttt{msg[]}.
+        Any confusion between ``byte~0 of the CAN payload'' and ``byte~0 of
+        the FCP frame'' produces a protocol discrepancy. That is exactly
+        the SET\_REG case study of \cref{sec:discrepancy}.
+  \item Acknowledgements and register-read responses are both produced by
+        the same TX handler. If they share a CAN identifier, a consumer
+        cannot tell a successful write from a four-byte value. Separating
+        them by identifier, using frame size as the discriminant, is the
+        repair described in \cref{sec:ack}.
+\end{itemize}
+
+\section{Dynamometer test benches}
+\label{sec:dyno}
+
+A dynamometer imposes a mechanical boundary condition on a rotating
+machine: a speed, a torque, or a more elaborate profile such as a driving
+cycle~\cite{isermann2014engine}. In an inverter characterisation campaign
+the dyno software is typically the master of the experiment. It
+
+\begin{itemize}[leftmargin=1.6em]
+  \item brings the UUT to a defined state (idle, aligned, running);
+  \item programs references (speed, $I_q$, $I_d$) and the time over which
+        they must be reached;
+  \item samples electrical and thermal quantities in lock-step with the
+        mechanical ones;
+  \item reacts to faults (over-current, over-voltage, over-temperature)
+        faster than a human operator.
+\end{itemize}
+
+All four items are CAN messages in this project. The first is
+\texttt{EXECUTE\_COMMAND}. The second is the family of set-point and ramp
+commands. The third is the ten-message diagnostic stack emitted every
+\SI{100}{\milli\second}. The fourth is the combination of the machine-state
+diagnostic, the fault-acknowledge flag and the NACK path.
+
+The GUI developed in \cref{ch:gui} does not replace the dyno software. It
+replaces the \emph{manual} use of PCAN-View during bring-up and during
+tests that a human still wants to drive---PI tuning, visual inspection of
+current loops, fault recovery---while using the same DBC that a fully
+automated CAPL script, or the dyno computer itself, can consume.
+
+\section{Tooling}
+\label{sec:tools}
+
+Three tools dominate the validation chapters and are therefore introduced
+here, briefly.
+
+\paragraph{PCAN-View} is PEAK-System's bus monitor and injector, used with
+a PCAN-USB FD adapter~\cite{pcanview}. It is the lowest-level stimulus:
+the engineer types an identifier, a DLC and eight hex bytes, and the
+adapter puts that frame on the wire. It is also the lowest-level oracle:
+if the ten diagnostic identifiers do not appear every \SI{100}{\milli\second},
+the physical layer or the TX path is broken, regardless of what the GUI
+says.
+
+\paragraph{TRACE32} is Lauterbach's hardware debugger~\cite{trace32}.
+Attached to the SR5E1 debug port it can halt the core on the FDCAN
+interrupt, step through \texttt{DYNO2DWProtocol}, and show the local
+\texttt{msg[]} buffer and the Motor Control handles. Combined with PCAN-View
+it gives an end-to-end trace from ``frame on the bus'' to ``function
+called in the SDK''.
+
+\paragraph{Vector CANalyzer} sits one level above both~\cite{vectorcanalyzer}.
+It loads the DBC, runs CAPL~\cite{vectorcapl} on identifier and system-variable
+events, and exposes those system variables to any COM client. The Python GUI
+of \cref{ch:gui} is one such client. CANalyzer, not Python, owns the
+real-time path; Python owns widgets, gauges and plots.

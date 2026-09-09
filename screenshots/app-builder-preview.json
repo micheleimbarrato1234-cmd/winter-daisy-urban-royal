@@ -1,0 +1,36 @@
+{
+  "url": "http://127.0.0.1:8080/",
+  "viewports": {
+    "desktop": {
+      "width": 1280,
+      "height": 800,
+      "status": 200,
+      "title": "CAN Thesis",
+      "hasCanvas": false,
+      "bodyTextLen": 1074,
+      "bodyTextHash": "c7f6f8624c0324b0deb90748934ace8136dba334304c267fcaa252aba3419f12",
+      "bodyTextPrefix": "MASTER OF SCIENCE THESIS Download LaTeX ELECTRONIC ENGINEERING ·",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-preview.png"
+    },
+    "mobile": {
+      "width": 390,
+      "height": 844,
+      "status": 200,
+      "title": "CAN Thesis",
+      "hasCanvas": false,
+      "bodyTextLen": 1074,
+      "bodyTextHash": "c7f6f8624c0324b0deb90748934ace8136dba334304c267fcaa252aba3419f12",
+      "bodyTextPrefix": "MASTER OF SCIENCE THESIS Download LaTeX ELECTRONIC ENGINEERING ·",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-preview-mobile.png"
+    }
+  },
+  "brandWarnings": [],
+  "authWarnings": [],
+  "verdictFile": "/workspace/screenshots/app-builder-preview.json"
+}

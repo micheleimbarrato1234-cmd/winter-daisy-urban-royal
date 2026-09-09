@@ -1,0 +1,128 @@
+\chapter{Extended Listings}
+\label{ch:app}
+
+The listings in the main chapters are shortened to the statements that
+carry the argument. This appendix reproduces the surrounding functions
+at the length that a re-implementer would want.
+
+\section{Periodic diagnostic stack}
+
+\begin{lstlisting}[style=cstyle,caption={Diagnostic register list and Send\_Status sketch.}]
+#define CAN_NUM_MSG  10
+
+uint8_t msg_tx_diag_can[CAN_NUM_MSG] = {
+    MC_PROTOCOL_REG_UNDEFINED,    /* sequence counter, 100 ms */
+    MC_PROTOCOL_REG_SPEED_REF,
+    MC_PROTOCOL_REG_TORQUE_REF,
+    MC_PROTOCOL_REG_FLUX_REF,
+    MC_PROTOCOL_REG_BUS_VOLTAGE,
+    MC_PROTOCOL_REG_HEATS_TEMP,
+    MC_PROTOCOL_REG_SPEED_MEAS,
+    MC_PROTOCOL_REG_TORQUE_MEAS,
+    MC_PROTOCOL_REG_FLUX_MEAS,
+    MC_PROTOCOL_REG_STATUS
+};
+
+uint8_t Send_Status(MCP_Handle_t *pHandle)
+{
+    if (FCP_TRANSFER_IDLE == pHandle->pFCP->TxFrameState) {
+        for (i = 0; i < CAN_NUM_MSG; i++) {
+            support_buffer = UI_GetReg(&pHandle->_Super,
+                                       msg_tx_diag_can[i], NULL);
+            /* pack support_buffer little-endian, ID = reg + 0x40 */
+            pHandle->pFCP->TxFrame.Code = code;
+            pHandle->pFCP->TxFrame.Size = size;
+            DBCCAN_TX_IRQ_Handler(pHandle->pFCP);
+        }
+    }
+    return 0;
+}
+\end{lstlisting}
+
+\section{Flux-ramp call chain}
+
+\begin{lstlisting}[style=cstyle,caption={Complete UI / MCI / STC flux-ramp chain.}]
+__weak bool UI_ExecFluxRamp(UI_Handle_t *pHandle,
+                            qd_t Vqd, uint16_t hDurationms)
+{
+    MCI_Handle_t *pMCI = pHandle->pMCI[pHandle->bSelectedDrive];
+    MCI_ExecFluxRamp(pMCI, Vqd, hDurationms);
+    return true;
+}
+
+__weak void MCI_ExecFluxRamp(MCI_Handle_t *pHandle,
+                             qd_t Iqdref, uint16_t hDurationms)
+{
+    pHandle->lastCommand  = MCI_EXECFLUXTRAMP;
+    pHandle->hFinalFlux   = Iqdref.d;
+    pHandle->hDurationms  = hDurationms;
+    pHandle->CommandState = MCI_COMMAND_NOT_ALREADY_EXECUTED;
+}
+
+__weak bool STC_ExecCurrentRamps(SpeednTorqCtrl_Handle_t *pHandle,
+                                 int16_t hFinalFlux,
+                                 uint16_t hDurationms)
+{
+    bool     AllowedRange = true;
+    uint32_t wAux;
+    int32_t  wAux1;
+    int16_t  hCurrentReferenceId = STC_GetFluxRef(pHandle);
+
+    if (AllowedRange == true) {
+        STC_SetControlMode(pHandle, STC_TORQUE_MODE);
+        if (hDurationms == 0u) {
+            pHandle->FluxRef             = (int32_t)hFinalFlux * 65536;
+            pHandle->RampRemainingStepId = 0u;
+            pHandle->IncDecAmountId      = 0;
+        } else {
+            pHandle->TargetFinalId = hFinalFlux;
+            wAux  = (uint32_t)hDurationms
+                  * (uint32_t)pHandle->STCFrequencyHz;
+            wAux /= 1000u;
+            pHandle->RampRemainingStepId = wAux + 1u;
+            wAux1  = ((int32_t)hFinalFlux
+                    - (int32_t)hCurrentReferenceId) * 65536;
+            wAux1 /= (int32_t)pHandle->RampRemainingStepId;
+            pHandle->IncDecAmountId = wAux1;
+        }
+    }
+    return AllowedRange;
+}
+\end{lstlisting}
+
+\section{CAPL command and diagnostic events}
+
+\begin{lstlisting}[style=caplstyle,caption={CAPL command and diagnostic events as deployed.}]
+on sysvar SET_SPEED_RAMP::SET_RAMP
+{
+  message SET_RAMP msgSpeedRamp;
+  if (@this == 1 &&
+      is_finalSpeed_ready == 1 &&
+      is_durSpeed_ready   == 1)
+  {
+    msgSpeedRamp.FinalSpeed_execrmp = g_finalSpeed_value;
+    msgSpeedRamp.Duration_execrmp   = g_durSpeed_value;
+    output(msgSpeedRamp);
+  }
+}
+
+void send_pi_message(word reg_id, int val, int denom)
+{
+  message SET_REG msg;
+  msg.REGISTER_ID          = reg_id;
+  msg.REGISTER_VALUE       = val;
+  msg.REGISTER_VALUE_DENOM = denom;
+  output(msg);
+}
+
+on message DIAG_TORQUE_REF
+{
+  @DIAG_MESSAGES::TORQUE_REF = this.DWord(0);
+}
+
+on message REG_VALUE
+{
+  @GET_REG::K_num = this.GET_K_NUMERATOR;
+  @GET_REG::K_den = this.GET_K_DENOMINATOR;
+}
+\end{lstlisting}

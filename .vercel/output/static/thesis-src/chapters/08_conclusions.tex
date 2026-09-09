@@ -1,0 +1,99 @@
+\chapter{Conclusions and Outlook}
+\label{ch:conc}
+
+\section{Results}
+The project set out to make the CAN interface between a Stellar-E inverter
+and a dynamometer bench automatable. That sentence unpacks into three
+artefacts that now agree with each other.
+
+\paragraph{The SR5E1 CAN library is a contract, not a collection of
+handlers.}
+\texttt{EXECUTE\_COMMAND} commits to a single Motor Control command per
+frame. Independent $I_d$ and $I_q$ references exist as first-class codes.
+The torque ramp is reachable from CAN, and a flux ramp that the SDK did
+not previously offer is implemented through the UI, MCI and STC layers
+with the same Q16 increment law as the torque path. PI gains travel as a
+packed 32-bit word, numerator and $2^n$ divisor together. ACK/NACK and
+\texttt{GET\_REG} no longer share an identifier. Each of those statements
+was confirmed on hardware with PCAN-View and TRACE32, not only in
+review.
+
+\paragraph{The DBC is a projection of that contract.}
+Identifiers follow the $+$\texttt{0x30}/$+$\texttt{0x40} offset rule,
+with an explicit exception for the independent current commands where
+the naive offset would have collided. Acknowledgement codes
+\texttt{0xF0} and \texttt{0xFF} are payload values of message
+\texttt{0x10}, not identifiers. Signal layouts---bit-masks, little-endian
+physical values, packed PI words---match the C unpacking. The
+SET\_REG discrepancy against the dishwasher specification was resolved
+by documenting the firmware as authoritative and encoding that layout
+in the DBC, rather than by breaking boards already in the field.
+
+\paragraph{An operator can drive the inverter without composing
+hexadecimal.}
+Vector CANalyzer owns timing and encoding. A Python GUI, talking only
+to system variables through the COM API, exposes start/stop, speed
+ramps, three PI loops, independent current axes and live plots. CAPL
+ready-flags keep incomplete multi-parameter commands off the bus.
+
+Taken together, the chain supports the use-cases that motivated the
+work: a speed sweep with a defined duration, a current-loop tuning
+session with live $I_d$/$I_q$ charts, a PI write that round-trips, and
+a diagnostic stream at \SI{100}{\milli\second} that a CAPL script or
+the dyno computer can consume without a human in the loop.
+
+\section{Limitations}
+Several limitations are accepted rather than accidental.
+
+\begin{itemize}[leftmargin=1.6em]
+  \item The physical layer was validated as CAN~2.0 with 11-bit
+        identifiers. The FDCAN peripheral can do more; the DBC and the
+        GUI cannot, until someone extends both.
+  \item Range checking of current and speed set-points is left to the
+        Motor Control SDK. A hostile or mistaken CAPL script can still
+        request a value that the regulators will saturate. A future
+        saturation layer on the DYNO2DW boundary would make NACKs more
+        informative, at the cost of a second source of limits.
+  \item The GUI is a Windows process that requires a licensed CANalyzer
+        installation. It is the right tool for this laboratory and the
+        wrong tool for a headless continuous-integration rack. The
+        sysvar/DBC contract, however, is reusable from a CAPL-only
+        configuration or from any other COM client.
+  \item Functional-safety aspects of Stellar-E (lockstep, watchdog,
+        ISO~26262 assumptions) were out of scope. The interface is a
+        laboratory automation layer, not a safety element.
+\end{itemize}
+
+\section{Outlook}
+Three extensions follow naturally from the present contract.
+
+\paragraph{Scripted characterisation.}
+With the DBC stable, a CAPL (or Python-COM) script can replay a speed
+and current profile, log \texttt{REG\_VALUE} and the diagnostic stack,
+and produce a characterisation table without the GUI. The ready-flag
+discipline is exactly the guard that such a script needs.
+
+\paragraph{CAN FD and higher-rate telemetry.}
+Ten 4-byte messages every \SI{100}{\milli\second} are enough for
+operator gauges and tight for a fast current loop. Packing several
+registers into a single CAN-FD 64-byte frame, or shortening the period
+for a subset of signals, is a DBC-compatible change once the TX path
+is measured not to drop stacks under \texttt{FCP\_TRANSFER\_IDLE}
+back-pressure.
+
+\paragraph{Bidirectional PI scheduling.}
+The packed write of \cref{sec:pi-pack} is atomic per gain. A single
+message that writes $K_p$ and $K_i$ of one loop together, or a
+read-modify-write of a loop's complete state, would make automated
+tuning (relay, Ziegler--Nichols, iterative feedback tuning) less
+sensitive to a control period that lands between two CAN frames.
+
+\section{Closing remark}
+The technical content of this thesis is a handful of C cases, a DBC
+file and a Python window. The engineering content is the refusal to let
+those three disagree. A bench that is automated on top of a silently
+wrong identifier map is worse than a bench that is operated by hand:
+it produces plots that look like measurements and are not. The
+debug chain of \cref{ch:val}---inject, halt, step, compare---is the
+method that keeps the plots honest, and it is the method this
+laboratory can reuse the next time a protocol code is added.
